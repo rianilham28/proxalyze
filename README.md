@@ -41,7 +41,8 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
 ## Example output
 
 `examples/out/` holds a dummy result (RFC 5737 documentation addresses), in
-sorted order `protocol, IP, port`:
+canonical best-first order: anonymity class (elite → anonymous → transparent →
+unjudged → auth-required), then check latency, then protocol/address:
 
 ```
 $ proxalyze -i examples/sample.txt
@@ -52,8 +53,8 @@ $ proxalyze -i examples/sample.txt
 ```
 
 `proxies.txt` — one usable line per survivor (credentials preserved where the
-input had them), `proxies.jsonl` — the same proxies plus everything the run
-learned: `connect_ms` / `ttfb_ms` / `speed_ms`, `anonymity`, `exit_ip`, `asn`,
+input had them), `proxies.jsonl` — the same proxies in the same order plus
+everything the run learned: `connect_ms` / `ttfb_ms` / `speed_ms`, `anonymity`, `exit_ip`, `asn`,
 `org`, network-class `tags`.
 
 ## Install

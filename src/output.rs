@@ -38,10 +38,23 @@ fn addr_of(proxy_url: &str) -> (Option<SocketAddr>, &str) {
     (hp.rsplit_once('@').map_or(hp, |(_, a)| a).parse().ok(), hp)
 }
 
+/// 0 elite · 1 anonymous · 2 transparent · 3 live-unjudged · 4 auth-required
+fn rank(r: &LiveRecord) -> u8 {
+    if r.tags.contains(&"auth-required") {
+        return 4;
+    }
+    match r.anonymity {
+        Some("elite") => 0,
+        Some("anonymous") => 1,
+        Some("transparent") => 2,
+        _ => 3,
+    }
+}
+
 pub fn sort_records(records: &mut [LiveRecord]) {
     records.sort_by(|a, b| {
-        let ka = (scheme_key(a.type_), addr_of(&a.proxy));
-        let kb = (scheme_key(b.type_), addr_of(&b.proxy));
+        let ka = (rank(a), a.speed_ms, scheme_key(a.type_), addr_of(&a.proxy));
+        let kb = (rank(b), b.speed_ms, scheme_key(b.type_), addr_of(&b.proxy));
         ka.cmp(&kb)
     });
 }
