@@ -40,9 +40,11 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
 
 ## Example output
 
-`examples/out/` holds a dummy result (RFC 5737 documentation addresses), in
-canonical best-first order: anonymity class (elite → anonymous → transparent →
-unjudged → auth-required), then check latency, then protocol/address:
+`examples/out/` holds a dummy result (RFC 5737 documentation addresses — a
+live run against them validates 0, so these files are illustrative records,
+not a captured run), in canonical best-first order: anonymity class
+(elite → anonymous → transparent → unjudged → auth-required), then check
+latency, then protocol/address:
 
 ```
 $ proxalyze -i examples/sample.txt

@@ -132,6 +132,151 @@ mod tests {
         );
     }
 
+    /// The checked-in dummy outputs must stay honest: same row set and order
+    /// as proxies.txt, keys of the real schema, classification semantics per
+    /// validate::classify, credentials that exist in the sample input, and an
+    /// order that survives the real sort_records. CI runs this on every push.
+    #[test]
+    fn checked_in_samples_stay_self_consistent() {
+        let jsonl_raw = include_str!("../examples/out/proxies.jsonl");
+        let txt_raw = include_str!("../examples/out/proxies.txt");
+        let input_raw = include_str!("../examples/sample.txt");
+        let rows: Vec<serde_json::Value> = jsonl_raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let txt: Vec<&str> = txt_raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        // 1) file order equals what the real sorter produces for these rows
+        let intern_anon = |s: Option<&str>| -> Option<&'static str> {
+            match s {
+                Some("elite") => Some("elite"),
+                Some("anonymous") => Some("anonymous"),
+                Some("transparent") => Some("transparent"),
+                _ => None,
+            }
+        };
+        let intern_tag = |s: &str| -> &'static str {
+            match s {
+                "hosting" => "hosting",
+                "auth-required" => "auth-required",
+                "cdn" => "cdn",
+                "mobile" => "mobile",
+                "vpn" => "vpn",
+                _ => "residential-proxy",
+            }
+        };
+        let mut sorted: Vec<LiveRecord> = rows
+            .iter()
+            .map(|r| LiveRecord {
+                proxy: r["proxy"].as_str().unwrap().to_string(),
+                type_: "http",
+                last_checked: 0,
+                speed_ms: r["speed_ms"].as_u64().unwrap() as u32,
+                connect_ms: 0,
+                ttfb_ms: None,
+                anonymity: intern_anon(r["anonymity"].as_str()),
+                exit_ip: None,
+                asn: None,
+                org: None,
+                tags: r["tags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| intern_tag(t.as_str().unwrap()))
+                    .collect(),
+            })
+            .collect();
+        sort_records(&mut sorted);
+        let order_after: Vec<&str> = sorted.iter().map(|r| r.proxy.as_str()).collect();
+        let order_file: Vec<&str> = rows.iter().map(|r| r["proxy"].as_str().unwrap()).collect();
+        assert_eq!(
+            order_after, order_file,
+            "sample rows must already be in best-first order"
+        );
+        // 2) proxies.txt and proxies.jsonl describe identical survivors, same order
+        assert_eq!(
+            txt, order_file,
+            "proxies.txt rows must equal jsonl proxy rows"
+        );
+        // 3) schema keys exactly the emittable set; classification is self-consistent
+        for r in &rows {
+            let keys: std::collections::BTreeSet<String> =
+                r.as_object().unwrap().keys().cloned().collect();
+            let expected: std::collections::BTreeSet<String> = [
+                "proxy",
+                "type",
+                "last_checked",
+                "speed_ms",
+                "connect_ms",
+                "ttfb_ms",
+                "anonymity",
+                "exit_ip",
+                "asn",
+                "org",
+                "tags",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            assert!(keys.is_subset(&expected), "unexpected key in {r}");
+            assert!(expected.iter().any(|k| keys.contains(k)));
+            let proxy = r["proxy"].as_str().unwrap();
+            let host = proxy
+                .split("://")
+                .nth(1)
+                .unwrap()
+                .rsplit('@')
+                .next()
+                .unwrap();
+            let hostip = host.rsplit(':').nth(1).unwrap();
+            let anon = r["anonymity"].as_str();
+            let exit = r["exit_ip"].as_str();
+            let auth = r["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "auth-required");
+            match (anon, auth) {
+                (Some("elite"), _) => {
+                    assert_eq!(exit, Some(hostip), "elite exit_ip must equal proxy ip: {r}")
+                }
+                (Some("anonymous"), _) => assert!(
+                    exit.is_some() && exit != Some(hostip),
+                    "anonymous needs NAT-distinct exit: {r}"
+                ),
+                (None, true) => assert!(exit.is_none(), "auth-required rows carry no exit: {r}"),
+                (Some("transparent"), false) => {
+                    assert!(exit.is_some(), "transparent needs an exit: {r}")
+                }
+                (Some(_), _) | (None, false) => panic!("no other shape is valid: {r}"),
+            }
+            // 4) credentials in outputs must exist in the input that produced them
+            if proxy.contains('@') {
+                assert!(
+                    input_raw.contains(
+                        proxy
+                            .split("://")
+                            .nth(1)
+                            .unwrap()
+                            .split('@')
+                            .next()
+                            .unwrap()
+                    ),
+                    "credential {proxy} absent from sample.txt"
+                );
+            }
+        }
+        // 5) input placeholders must not parse into phantom candidates
+        let comment_candidates =
+            crate::parse::parse_proxies(input_raw.as_bytes(), crate::model::Scheme::Http);
+        assert_eq!(
+            comment_candidates.len(),
+            3,
+            "sample.txt comments leaked parseable patterns"
+        );
+    }
+
     #[test]
     fn stats_percentile_edges() {
         let s = Stats::default();

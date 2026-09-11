@@ -29,15 +29,17 @@ pub struct Entry {
 pub fn parse_proxies(body: &[u8], claim: Scheme) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     scan_prefixed(body, claim, &mut out);
-    for (addr, auth) in scan_bare(body) {
-        if !out
-            .iter()
-            .any(|e| e.addr == addr && e.auth == auth && e.scheme != claim)
-        {
+    for (addr, _) in scan_bare(body) {
+        // A bare re-sighting of an address already explained by a prefixed
+        // line (`scheme://…` or `user:pass@…`) is a substring artifact of
+        // that very line, not a second declaration — checking the phantom
+        // would double-probe credentialed entries and mislabel scheme-
+        // prefixed ones under the file claim.
+        if !out.iter().any(|e| e.addr == addr) {
             out.push(Entry {
                 addr,
                 scheme: claim,
-                auth,
+                auth: None,
             });
         }
     }
@@ -211,6 +213,10 @@ mod tests {
         );
         let e = find("5.6.7.8:1080").unwrap();
         assert_eq!(e.scheme, Scheme::Socks5);
+        // one candidate per address — no bare phantoms of prefixed lines
+        let addrs: Vec<String> = out.iter().map(|e| e.addr.to_string()).collect();
+        let uniq: std::collections::HashSet<&String> = addrs.iter().collect();
+        assert_eq!(addrs.len(), uniq.len(), "phantom duplicates: {addrs:?}");
         let e = find("9.9.9.9:3128").unwrap();
         assert_eq!(
             (e.scheme, e.auth.as_ref().unwrap().to_string()),
