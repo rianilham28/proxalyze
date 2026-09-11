@@ -15,6 +15,7 @@
 //! Note: passwords are matched over `[A-Za-z0-9._\-]` inside the token;
 //! exotic symbol-heavy passwords should be re-encoded at the proxy.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::model::{Auth, Scheme};
@@ -29,13 +30,15 @@ pub struct Entry {
 pub fn parse_proxies(body: &[u8], claim: Scheme) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     scan_prefixed(body, claim, &mut out);
+    // A bare re-sighting of an address already explained by a prefixed line
+    // (`scheme://…` or `user:pass@…`) is a substring artifact of that very
+    // line, not a second declaration — checking the phantom would double-
+    // probe credentialed entries and mislabel scheme-prefixed ones under the
+    // file claim. Set-based: real-world lists run 100k+ prefixed lines, and
+    // a per-candidate linear scan is quadratic on exactly that input.
+    let mut seen: HashSet<SocketAddr> = out.iter().map(|e| e.addr).collect();
     for (addr, _) in scan_bare(body) {
-        // A bare re-sighting of an address already explained by a prefixed
-        // line (`scheme://…` or `user:pass@…`) is a substring artifact of
-        // that very line, not a second declaration — checking the phantom
-        // would double-probe credentialed entries and mislabel scheme-
-        // prefixed ones under the file claim.
-        if !out.iter().any(|e| e.addr == addr) {
+        if seen.insert(addr) {
             out.push(Entry {
                 addr,
                 scheme: claim,
@@ -227,6 +230,25 @@ mod tests {
             (e.scheme, e.auth.as_ref().unwrap().to_string()),
             (Scheme::Http, "user:pass".into())
         );
+    }
+
+    #[test]
+    fn prefixed_line_claims_its_address() {
+        // credentialed line: exactly one entry, carrying the credentials
+        let out = parse_proxies(b"http://bob:p@1.2.3.4:80\n", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].auth.as_ref().unwrap().user, "bob");
+        // scheme-prefixed line: one entry — no twin under the file claim
+        let out = parse_proxies(b"socks5://1.2.3.4:1080\n", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].scheme, Scheme::Socks5);
+        // bare lines: one candidate each under the claim
+        let out = parse_proxies(b"1.2.3.4:8080\n5.6.7.8:8080\n", Scheme::Http);
+        assert_eq!(out.len(), 2);
+        // prefixed wins over a real duplicate bare line (documented loss)
+        let out = parse_proxies(b"1.2.3.4:8080\nsocks5://1.2.3.4:8080\n", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].scheme, Scheme::Socks5);
     }
 
     #[test]
