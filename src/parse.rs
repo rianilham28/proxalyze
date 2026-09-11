@@ -52,8 +52,12 @@ pub fn parse_proxies(body: &[u8], claim: Scheme) -> Vec<Entry> {
 /// Letter-aware pass: tokens containing `://` (scheme + optional creds) or
 /// `@ip:port` (creds + file claim).
 fn scan_prefixed(body: &[u8], claim: Scheme, out: &mut Vec<Entry>) {
-    let keep =
-        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'/' | b'@' | b'-' | b'_');
+    // brackets included: scheme-prefixed IPv6 (`socks5://[v6]:1080`) and
+    // credentialed IPv6 (`user:pass@[v6]:8080`) are real list shapes
+    let keep = |b: u8| {
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'.' | b':' | b'/' | b'@' | b'-' | b'_' | b'[' | b']')
+    };
     let mut start = None::<usize>;
     let flush = |s: Option<usize>, e: usize, out: &mut Vec<Entry>| {
         let Some(s) = s else { return };
@@ -245,6 +249,15 @@ mod tests {
         // bare lines: one candidate each under the claim
         let out = parse_proxies(b"1.2.3.4:8080\n5.6.7.8:8080\n", Scheme::Http);
         assert_eq!(out.len(), 2);
+        // bracketed IPv6: scheme-prefixed with and without credentials
+        let out = parse_proxies(b"socks5://bob:p@[2001:db8::1]:1080\n", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].scheme, Scheme::Socks5);
+        assert_eq!(out[0].auth.as_ref().unwrap().user, "bob");
+        let out = parse_proxies(b"socks5://[2001:db8::1]:1080\n", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        // malformed (missing open bracket) is rejected, not half-parsed
+        assert!(parse_proxies(b"socks5://bob:p@2001:db8::1]:1080\n", Scheme::Http).is_empty());
         // prefixed wins over a real duplicate bare line (documented loss)
         let out = parse_proxies(b"1.2.3.4:8080\nsocks5://1.2.3.4:8080\n", Scheme::Http);
         assert_eq!(out.len(), 1);
