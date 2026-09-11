@@ -1,0 +1,7 @@
+/target
+/out
+/out-*/
+/geo/
+/lists/
+/proxies.txt
+/mise.toml

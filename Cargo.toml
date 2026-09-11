@@ -1,0 +1,40 @@
+[package]
+name = "proxalyze"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Validate proxy lists (plain txt + declared scheme) into clean, checked proxy files"
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+
+# Check lane: raw hyper client::conn handshake per proxy (no pool). hyper-util's
+# tokio feature supplies TokioIo, the rt::Read/Write adapter.
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http = "1.5"
+http-body-util = "0.1.5"
+bytes = "1"
+
+# Proxy transports
+tokio-socks = "0.5.3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0"
+
+# Geo judgment: offline MaxMind databases, provided by the operator
+maxminddb = "0.31"
+
+# Config & output
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+url = "2.5"
+rlimit = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

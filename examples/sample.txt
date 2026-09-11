@@ -1,0 +1,11 @@
+# proxalyze sample input — declares its protocol on the command line:
+#   proxalyze -i examples/sample.txt:http
+# Recognised line forms (protocol never guessed from a bare address):
+#   1.2.3.4:8080
+#   socks5://1.2.3.4:1080
+#   http://user:pass@1.2.3.4:8080
+#   user:pass@1.2.3.4:8080
+#   1.2.3.0/24:8080
+203.0.113.10:8080
+203.0.113.11:3128
+socks5://203.0.113.12:1080
