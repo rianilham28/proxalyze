@@ -38,6 +38,24 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
   automatically; per-check budgets with zero retries; integrity counters hard-fail
   on dropped results.
 
+## Example output
+
+`examples/out/` holds a dummy result (RFC 5737 documentation addresses), in
+sorted order `protocol, IP, port`:
+
+```
+$ proxalyze -i examples/sample.txt
+[parse ] 1 files · 3 unique candidates (0 dupes) in 0.0s · check https://ipv4.icanhazip.com
+[check ]       3/3       100%    4/s  done in   0.7s
+  ...
+[write ] out/proxies.txt (92 bytes) · out/proxies.jsonl (655 bytes) in 0.00s
+```
+
+`proxies.txt` — one usable line per survivor (credentials preserved where the
+input had them), `proxies.jsonl` — the same proxies plus everything the run
+learned: `connect_ms` / `ttfb_ms` / `speed_ms`, `anonymity`, `exit_ip`, `asn`,
+`org`, network-class `tags`.
+
 ## Install
 
 Grab a binary from [releases](../../releases) (`proxalyze-<target>.tar.gz`), or:
