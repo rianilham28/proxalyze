@@ -1,0 +1,90 @@
+name: Pool refresh
+
+# Nightly harvest (proxplore) -> validate (proxalyze) -> commit the clean pool
+# back to this repo. GitHub-hosted runners are already isolated microVMs, so no
+# external sandbox is needed here; the only cross-repo dependency is proxplore's
+# source, which this job downloads and builds (see PROXPLORE_REPO).
+#
+# PREREQUISITE: PROXPLORE_REPO must exist on GitHub (public, or reachable with
+# github.token / a PROXPLORE_REPO secret). The "Download proxplore" step fails
+# loudly otherwise.
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # 04:17 UTC daily — off the top of the hour
+  workflow_dispatch:
+    inputs:
+      providers:
+        description: "Restrict proxplore to these provider ids (comma-separated; empty = all)"
+        required: false
+        default: ""
+      jobs:
+        description: "proxalyze concurrency (-j)"
+        required: false
+        default: "1024"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PROXPLORE_REPO: rianilham28/proxplore
+  POOL_DIR: pool
+
+concurrency:
+  group: pool-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # proxalyze (this repo)
+
+      - name: Download proxplore
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PROXPLORE_REPO }}
+          path: proxplore
+          token: ${{ secrets.PROXPLORE_REPO_TOKEN || github.token }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pool
+
+      - name: Build validator + harvester
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          ( cd proxplore && cargo build --release --locked --bin proxplore )
+
+      - name: Harvest (proxplore)
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          args=()
+          if [ -n "${{ inputs.providers }}" ]; then args+=(--providers "${{ inputs.providers }}"); fi
+          proxplore/target/release/proxplore --output work/proxies.txt "${args[@]}"
+          echo "harvested $(wc -l < work/proxies.txt) candidates"
+
+      - name: Validate (proxalyze)
+        run: |
+          set -euo pipefail
+          mkdir -p "$POOL_DIR"
+          ./target/release/proxalyze -i work/proxies.txt --out "$POOL_DIR" \
+            -j "${{ inputs.jobs || '1024' }}"
+          echo "validated $(wc -l < "$POOL_DIR/proxies.txt") survivors"
+
+      - name: Commit + push pool
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$POOL_DIR/proxies.txt" "$POOL_DIR/proxies.jsonl"
+          if git diff --staged --quiet; then
+            echo "pool unchanged — nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d))"
+          git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
