@@ -5,9 +5,16 @@ name: Pool refresh
 # external sandbox is needed here; the only cross-repo dependency is proxplore's
 # source, which this job downloads and builds (see PROXPLORE_REPO).
 #
-# PREREQUISITE: PROXPLORE_REPO must exist on GitHub (public, or reachable with
-# github.token / a PROXPLORE_REPO secret). The "Download proxplore" step fails
-# loudly otherwise.
+# proxplore is PUBLIC on GitHub, so the default GITHUB_TOKEN can check it out.
+# If it ever goes private, set a read-only PAT (scoped to proxplore) as the
+# PROXPLORE_REPO_TOKEN secret on this repo.
+#
+# Quality note: proxalyze writes a survivor when status is "live" OR
+# "auth-required" (main.rs:223), but a credential-gated "auth-required" proxy is
+# only reachable-with-a-login, NOT proven usable. So the gate below measures the
+# LIVE count (proxies whose exit IP came back) from proxies.jsonl and refuses to
+# overwrite a good pool when the live count collapses — which is what a shared
+# datacenter egress IP hitting these free feeds will do without a rotating proxy.
 
 on:
   schedule:
@@ -22,6 +29,10 @@ on:
         description: "proxalyze concurrency (-j)"
         required: false
         default: "1024"
+      min_live:
+        description: "Fail (and keep last good pool) if fewer than this many LIVE proxies"
+        required: false
+        default: "100"
 
 permissions:
   contents: write
@@ -59,24 +70,73 @@ jobs:
           cargo build --release --locked
           ( cd proxplore && cargo build --release --locked --bin proxplore )
 
+      # Run proxplore from ITS repo root: its registry-completeness guard does
+      # read_dir("src/providers") relative to cwd (main.rs:78-80), so running it
+      # from the proxalyze tree would silently no-op that self-check. PROXPLORE_
+      # PROXY_URL is read straight from the environment by the --proxy-url arg
+      # (env binding in main.rs); unset => no rotation, empty string => same.
       - name: Harvest (proxplore)
+        env:
+          PROXPLORE_PROXY_URL: ${{ secrets.PROXPLORE_PROXY_URL }}
         run: |
           set -euo pipefail
-          mkdir -p work
-          args=()
+          ws="$GITHUB_WORKSPACE"
+          mkdir -p "$ws/work"
+          args=(--output "$ws/work/proxies.txt")
           if [ -n "${{ inputs.providers }}" ]; then args+=(--providers "${{ inputs.providers }}"); fi
-          proxplore/target/release/proxplore --output work/proxies.txt "${args[@]}"
-          echo "harvested $(wc -l < work/proxies.txt) candidates"
+          ( cd proxplore && ./target/release/proxplore "${args[@]}" )
+          echo "harvested $(wc -l < "$ws/work/proxies.txt") candidates"
 
       - name: Validate (proxalyze)
         run: |
           set -euo pipefail
-          mkdir -p "$POOL_DIR"
-          ./target/release/proxalyze -i work/proxies.txt --out "$POOL_DIR" \
+          ws="$GITHUB_WORKSPACE"
+          mkdir -p "$ws/$POOL_DIR"
+          ./target/release/proxalyze -i "$ws/work/proxies.txt" --out "$ws/$POOL_DIR" \
             -j "${{ inputs.jobs || '1024' }}"
-          echo "validated $(wc -l < "$POOL_DIR/proxies.txt") survivors"
+          echo "wrote $POOL_DIR: $(wc -l < "$ws/$POOL_DIR/proxies.txt") survivors"
+
+      # Always archive the raw harvest so a bad/green-but-empty run is diagnosable.
+      - name: Upload raw harvest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-harvest-${{ github.run_id }}
+          path: work/proxies.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Score + gate
+        id: gate
+        run: |
+          set -euo pipefail
+          ws="$GITHUB_WORKSPACE"
+          live=$(python3 - "$ws/$POOL_DIR/proxies.jsonl" <<'PY'
+          import json, sys
+          live = auth = 0
+          for ln in open(sys.argv[1]):
+              ln = ln.strip()
+              if not ln:
+                  continue
+              r = json.loads(ln)
+              if "auth-required" in (r.get("tags") or []):
+                  auth += 1
+              elif r.get("exit_ip"):
+                  live += 1
+          sys.stderr.write(f"live={live} auth_required={auth}\n")
+          print(live)
+          PY
+          )
+          min_live="${{ inputs.min_live || '100' }}"
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          if [ "$live" -lt "$min_live" ]; then
+            echo "::error::only $live LIVE proxies (< min_live=$min_live); keeping the last-good pool, not committing"
+            exit 1
+          fi
+          echo "pool is good ($live live) — will commit"
 
       - name: Commit + push pool
+        if: steps.gate.outputs.live != ''
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -86,5 +146,6 @@ jobs:
             echo "pool unchanged — nothing to commit"
             exit 0
           fi
-          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d))"
+          # [skip ci]: pushing to main would otherwise re-trigger CI's push job.
+          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d)) [skip ci]"
           git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
