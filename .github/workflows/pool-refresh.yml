@@ -80,6 +80,11 @@ jobs:
           PROXPLORE_PROXY_URL: ${{ secrets.PROXPLORE_PROXY_URL }}
         run: |
           set -euo pipefail
+          # GitHub renders an unset secret as "" (not absent). proxplore binds
+          # --proxy-url to $PROXPLORE_PROXY_URL via clap's env trait, which reads a
+          # present-but-EMPTY var as a provided proxy URL -> wreq RelativeUrlWithout-
+          # Base. Treat "" as genuinely unset.
+          if [ -z "${PROXPLORE_PROXY_URL:-}" ]; then unset PROXPLORE_PROXY_URL; fi
           ws="$GITHUB_WORKSPACE"
           mkdir -p "$ws/work"
           args=(--output "$ws/work/proxies.txt")
@@ -111,24 +116,30 @@ jobs:
         run: |
           set -euo pipefail
           ws="$GITHUB_WORKSPACE"
-          live=$(python3 - "$ws/$POOL_DIR/proxies.jsonl" <<'PY'
+          stats=$(python3 - "$ws/$POOL_DIR/proxies.jsonl" <<'PY'
           import json, sys
-          live = auth = 0
+          total = auth = exit_live = 0
           for ln in open(sys.argv[1]):
               ln = ln.strip()
               if not ln:
                   continue
+              total += 1
               r = json.loads(ln)
               if "auth-required" in (r.get("tags") or []):
                   auth += 1
-              elif r.get("exit_ip"):
-                  live += 1
-          sys.stderr.write(f"live={live} auth_required={auth}\n")
-          print(live)
+              if r.get("exit_ip"):
+                  exit_live += 1
+          # proxalyze writes a survivor when status is live OR auth-required, so
+          # the genuinely-live set is total minus auth-required (== its verdict line).
+          print(total - auth, auth, exit_live)
           PY
           )
-          min_live="${{ inputs.min_live || '100' }}"
+          read -r live auth exit_live <<<"$stats"
           echo "live=$live" >> "$GITHUB_OUTPUT"
+          echo "auth=$auth" >> "$GITHUB_OUTPUT"
+          echo "exit_live=$exit_live" >> "$GITHUB_OUTPUT"
+          echo "survivors: $((live + auth)) = live $live + auth-required $auth ($exit_live proved exit-IP)"
+          min_live="${{ inputs.min_live || '100' }}"
           if [ "$live" -lt "$min_live" ]; then
             echo "::error::only $live LIVE proxies (< min_live=$min_live); keeping the last-good pool, not committing"
             exit 1
@@ -147,5 +158,5 @@ jobs:
             exit 0
           fi
           # [skip ci]: pushing to main would otherwise re-trigger CI's push job.
-          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d)) [skip ci]"
+          git commit -m "chore(pool): refresh validated proxies ($(date -u +%Y-%m-%d)) — live ${{ steps.gate.outputs.live }} · auth-required ${{ steps.gate.outputs.auth }} [skip ci]"
           git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
