@@ -89,20 +89,17 @@ pub struct Validator {
     done: Arc<AtomicUsize>,
 }
 
-/// Progress redraw on stderr. A closed reader (`| head`, `| grep -m1`) is
-/// deliberate consumer shutdown: exit quietly instead of letting `eprint!`
-/// panic on EPIPE inside the progress task — that panic unwinds into the
-/// runtime and aborts a multi-minute run, losing every result.
-fn progress(msg: &str) {
+/// Progress redraw on stderr. Returns false once the sink is gone
+/// (`| head`, `| grep -m1`): the caller stops redrawing but the run
+/// finishes and still writes its report files — closing a pipe kills the
+/// display, never the work. (Before this guard an `eprint!` panic on EPIPE
+/// aborted minutes-long runs outright; process::exit on error was also wrong
+/// for the same reason.)
+fn progress(msg: &str) -> bool {
     use std::io::Write;
     let stderr = std::io::stderr();
     let mut h = stderr.lock();
-    if h.write_all(msg.as_bytes())
-        .and_then(|()| h.flush())
-        .is_err()
-    {
-        std::process::exit(0);
-    }
+    h.write_all(msg.as_bytes()).and_then(|()| h.flush()).is_ok()
 }
 
 impl Validator {
@@ -205,10 +202,18 @@ impl Validator {
                 let secs = t0.elapsed().as_secs_f64().max(0.001);
                 let rate = d as f64 / secs;
                 let eta = (total - d) as f64 / rate;
-                progress(&format!(
-                    "\r[check ] {d:>7}/{total:<7} {:>3}%  {rate:>5.0}/s  eta {eta:>4.0}s ",
+                let eta_s = if d >= 512 {
+                    format!("eta {eta:>4.0}s")
+                } else {
+                    "eta   ---".into()
+                }; // first batches all land at the connect-timeout mark:
+                // eta computed off them thrashes 2600s->700s and reads broken
+                if !progress(&format!(
+                    "\r[check ] {d:>7}/{total:<7} {:>3}%  {rate:>5.0}/s  {eta_s} ",
                     d * 100 / total
-                ));
+                )) {
+                    break; // display gone; finish the run silently
+                }
             }
             progress(&format!(
                 "\r[check ] {total:>7}/{total:<7} 100%  {:>5.1}/s  done in {:>5.1}s\n",

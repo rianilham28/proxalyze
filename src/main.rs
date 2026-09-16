@@ -175,6 +175,16 @@ fn expand_inputs(path: &str) -> Result<Vec<std::path::PathBuf>, Box<dyn Error>> 
     Ok(vec![p.to_path_buf()])
 }
 
+/// Informational print that never panics on a closed pipe (`| head`,
+/// `| grep -m1`): the reader leaving early is a display choice, not a
+/// reason to fail a completed run.
+macro_rules! qprintln {
+    ($($a:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($a)*);
+    }};
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -277,8 +287,8 @@ fn summary(
     total: usize,
     cfg: &Config,
 ) {
-    println!("summary");
-    println!(
+    qprintln!("summary");
+    qprintln!(
         "  verdict   live {} (elite {} \u{b7} anonymous {} \u{b7} transparent {}) \u{b7} auth {} \u{b7} tls-fail {} \u{b7} socks-rejected {} \u{b7} tcp-alive {} \u{b7} dead {}",
         fmt_n(stats.live_total()),
         fmt_n(stats.live_elite),
@@ -295,7 +305,7 @@ fn summary(
     con.sort_unstable();
     tot.sort_unstable();
     if !con.is_empty() {
-        println!(
+        qprintln!(
             "  latency   live connect p50/p90/p99: {} / {} / {} ms \u{b7} whole-check: {} / {} / {} ms  (dead probes each waited the {:.1}s connect window)",
             Stats::percentile(&con, 0.50),
             Stats::percentile(&con, 0.90),
@@ -307,7 +317,7 @@ fn summary(
         );
     }
     if !labels.is_empty() {
-        println!(
+        qprintln!(
             "  echoes    cap {} in-flight each",
             cfg.validate
                 .max_concurrent_checks
@@ -316,7 +326,7 @@ fn summary(
         );
         for (i, url) in labels.iter().enumerate() {
             let (live, tlsf, sat) = per_target.get(i).copied().unwrap_or((0, 0, 0));
-            println!(
+            qprintln!(
                 "            {url:<36} live {live:>5} \u{b7} tls-fail {tlsf:>5} \u{b7} permit-waits {sat}{}",
                 if sat > 0 {
                     "  <- raise -j or add --backup-url"
@@ -326,7 +336,7 @@ fn summary(
             );
         }
     }
-    println!("  inputs");
+    qprintln!("  inputs");
     let mut any = false;
     for (path, kept, _) in per_file {
         let (live, auth, checked) = stats.by_input.get(path).copied().unwrap_or((0, 0, *kept));
@@ -334,7 +344,7 @@ fn summary(
             continue;
         }
         any = true;
-        println!(
+        qprintln!(
             "            {path:<36} checked {:>7} \u{b7} live {:>5} ({:.1}%) \u{b7} auth-only {:>6}",
             fmt_n(checked),
             fmt_n(live),
@@ -343,9 +353,9 @@ fn summary(
         );
     }
     if !any {
-        println!("            (none)");
+        qprintln!("            (none)");
     }
-    println!(
+    qprintln!(
         "  integrity {}/{} results \u{2713} \u{b7} {} reportable \u{b7} {records} records \u{2713}",
         fmt_n(stats.received),
         fmt_n(total),
@@ -371,7 +381,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let judge = Judge::open(cfg.asn_db.as_deref())?;
-    println!(
+    qprintln!(
         "proxalyze {} \u{b7} workers {workers} ({wsrc}){}",
         env!("CARGO_PKG_VERSION"),
         match &cfg.asn_db {
@@ -390,9 +400,9 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
         } else {
             String::new()
         };
-        println!("[parse ] {path:<36} {:>8} kept{note}", fmt_n(*kept));
+        qprintln!("[parse ] {path:<36} {:>8} kept{note}", fmt_n(*kept));
     }
-    println!(
+    qprintln!(
         "[parse ] {} files \u{b7} {} unique candidates ({} dupes{}) in {:.1}s \u{b7} check {}",
         per_file.len(),
         fmt_n(candidates.len()),
@@ -406,7 +416,10 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
         cfg.validate.check_url,
     );
     if candidates.is_empty() {
-        return Err("no candidates".into());
+        // a fully-unparseable or empty input is a *measurement*, not a tool
+        // failure: exit 0 with the empty report (same contract as a run that
+        // checked N candidates and found 0 live)
+        qprintln!("[check ] 0 candidates \u{b7} nothing to check");
     }
     let total = candidates.len();
     let parse_secs = t_parse.elapsed().as_secs_f64();
@@ -428,15 +441,6 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
         )
         .into());
     }
-    summary(
-        &stats,
-        &per_file,
-        &per_target,
-        &labels,
-        records.len(),
-        total,
-        &cfg,
-    );
     let t_write = Instant::now();
     sort_records(&mut records);
     let dir = std::path::Path::new(&cfg.output.dir);
@@ -449,16 +453,25 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
             format!("{} ({} bytes)", p, fmt_n(size))
         })
         .collect();
-    println!(
+    qprintln!(
         "[write ] {} in {:.2}s",
         files.join(" \u{b7} "),
         t_write.elapsed().as_secs_f64()
     );
-    println!(
+    qprintln!(
         "[done  ] {:.1}s total (parse {:.2} \u{b7} check {check_secs:.1} \u{b7} write {:.2})",
         started.elapsed().as_secs_f64(),
         parse_secs,
         t_write.elapsed().as_secs_f64(),
+    );
+    summary(
+        &stats,
+        &per_file,
+        &per_target,
+        &labels,
+        records.len(),
+        total,
+        &cfg,
     );
     Ok(())
 }
