@@ -83,7 +83,7 @@ fn scan_prefixed(body: &[u8], claim: Scheme, out: &mut Vec<Entry>, mal: &mut usi
             let (auth, hostport) = split_auth(rest);
             if let Some(addr) = parse_addr_str(hostport.split('/').next().unwrap_or(hostport)) {
                 out.push(Entry { addr, scheme, auth });
-            } else if !hostport.is_empty() {
+            } else if proxy_ish(hostport.split('/').next().unwrap_or(hostport)) {
                 *mal += 1;
             }
         } else if tok.contains('@') {
@@ -95,7 +95,7 @@ fn scan_prefixed(body: &[u8], claim: Scheme, out: &mut Vec<Entry>, mal: &mut usi
                         scheme: claim,
                         auth,
                     });
-                } else if !hostport.is_empty() {
+                } else if proxy_ish(hostport) {
                     *mal += 1;
                 }
             }
@@ -224,6 +224,23 @@ pub fn parse_addr_str(tok: &str) -> Option<SocketAddr> {
     }
 }
 
+/// A `host:port` *declaration* (proxy-ish), not a general URL: host of
+/// `[alnum.-]`/brackets with a short numeric port after the final colon.
+/// Guards the malformed counter so `http://example.com/path` in prose is
+/// never tallied as a lost proxy.
+fn proxy_ish(rest: &str) -> bool {
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'[' | b']'))
+}
+
 /// IPv4 with decimal zero-padded octets normalized: scraper lists emit
 /// `03.161.30.65`/`103.250.166.04` routinely and the decimal intent is
 /// unambiguous (`u8` FromStr reads "072" as 72; Rust has no octal).
@@ -284,15 +301,39 @@ mod tests {
         // CIDR nets too
         let out = parse_proxies(b"010.1.2.0/30:8080\n", Scheme::Http);
         assert_eq!(out.len(), 2);
+        // full padding matrix: zero forms and mid-token pads
+        assert_eq!(
+            parse_addr_str("1.2.3.00:80"),
+            Some("1.2.3.0:80".parse().unwrap())
+        );
+        assert_eq!(
+            parse_addr_str("007.0.000.4:80"),
+            Some("7.0.0.4:80".parse().unwrap())
+        );
+        assert_eq!(
+            parse_addr_str("1.2.3.04:8080"),
+            Some("1.2.3.4:8080".parse().unwrap())
+        );
+        // still rejecting what is invalid in any reading
+        assert!(parse_addr_str("999.1.1.1:3128").is_none());
+        assert!(parse_addr_str("1015118.97.107.65:5430").is_none());
+        assert!(parse_addr_str("1.2.3:80").is_none());
     }
 
     #[test]
     fn declared_malformed_lines_are_counted_once() {
-        let body = "socks5://wsip-98-175-31-195.host.example.net:4145\n            http://1.2.3.256:80\n            user:pass@999.1.1.1:3128\n            random text, not a proxy\n"
+        let body = "socks5://wsip-98-175-31-195.host.example.net:4145\n\
+            http://1.2.3.256:80\n\
+            user:pass@999.1.1.1:3128\n\
+            see http://example.com/path for docs\n\
+            random text, not a proxy\n"
             .as_bytes();
         let (out, mal) = parse_proxies_stats(body, Scheme::Http);
-        assert!(out.is_empty());
-        assert_eq!(mal, 3, "hostname + octet256 + octet999; noise uncounted");
+        assert!(out.is_empty(), "got {out:?}");
+        assert_eq!(
+            mal, 3,
+            "hostname + octet256 + octet999; URLs/noise uncounted"
+        );
     }
 
     #[test]
