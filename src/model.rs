@@ -135,16 +135,18 @@ pub struct Stats {
     /// windows into percentiles reads as "p50 connect 0ms" nonsense
     pub live_connect_ms: Vec<u32>,
     pub live_total_ms: Vec<u32>,
-    pub by_input: HashMap<String, (usize, usize)>, // (live, checked)
+    pub by_input: HashMap<String, (usize, usize, usize)>, // (live, auth, checked)
 }
 
 impl Stats {
     pub fn record(&mut self, r: &ProbeResult) {
         self.received += 1;
-        let e = self.by_input.entry(r.input.clone()).or_insert((0, 0));
-        e.1 += 1;
-        if r.status == "live" {
-            e.0 += 1;
+        let e = self.by_input.entry(r.input.clone()).or_insert((0, 0, 0));
+        e.2 += 1;
+        match r.status {
+            "live" => e.0 += 1,
+            "auth-required" => e.1 += 1,
+            _ => {}
         }
         if r.status == "live" {
             self.live_connect_ms.push(r.connect_ms);

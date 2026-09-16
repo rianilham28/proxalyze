@@ -25,7 +25,7 @@ use config::{Config, InputFile, detect_asn_db, split_input_spec};
 use geo::Judge;
 use model::{Candidate, ProbeResult, Registry, Stats};
 use output::{sort_records, write_out};
-use parse::parse_proxies;
+use parse::parse_proxies_stats;
 use validate::{CheckCfg, Validator};
 
 #[derive(Parser)]
@@ -130,14 +130,16 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
     Ok(cfg)
 }
 
-async fn load_candidates(cfg: &Config) -> Result<(Registry, Vec<(String, usize)>), Box<dyn Error>> {
+async fn load_candidates(
+    cfg: &Config,
+) -> Result<(Registry, Vec<(String, usize, usize)>), Box<dyn Error>> {
     let mut registry = Registry::new();
     let mut per_file = Vec::new();
     for file in &cfg.inputs {
         let scheme = cfg.scheme_of(file).expect("validated in Config::check");
         for path in expand_inputs(&file.path)? {
             let body = std::fs::read(&path)?;
-            let entries = parse_proxies(&body, scheme);
+            let (entries, malformed) = parse_proxies_stats(&body, scheme);
             let label = path.display().to_string();
             let kept = entries
                 .into_iter()
@@ -150,7 +152,7 @@ async fn load_candidates(cfg: &Config) -> Result<(Registry, Vec<(String, usize)>
                     ))
                 })
                 .count();
-            per_file.push((label, kept));
+            per_file.push((label, kept, malformed));
         }
     }
     Ok((registry, per_file))
@@ -268,7 +270,7 @@ fn fmt_n(n: impl std::fmt::Display) -> String {
 
 fn summary(
     stats: &Stats,
-    per_file: &[(String, usize)],
+    per_file: &[(String, usize, usize)],
     per_target: &[(u64, u64, u64)],
     labels: &[String],
     records: usize,
@@ -326,17 +328,18 @@ fn summary(
     }
     println!("  inputs");
     let mut any = false;
-    for (path, kept) in per_file {
-        let (live, checked) = stats.by_input.get(path).copied().unwrap_or((0, *kept));
+    for (path, kept, _) in per_file {
+        let (live, auth, checked) = stats.by_input.get(path).copied().unwrap_or((0, 0, *kept));
         if *kept == 0 {
             continue;
         }
         any = true;
         println!(
-            "            {path:<36} checked {:>7} \u{b7} live {:>5} ({:.1}%)",
+            "            {path:<36} checked {:>7} \u{b7} live {:>5} ({:.1}%) \u{b7} auth-only {:>6}",
             fmt_n(checked),
             fmt_n(live),
-            100.0_f64 * live as f64 / checked.max(1) as f64
+            100.0_f64 * live as f64 / checked.max(1) as f64,
+            fmt_n(auth)
         );
     }
     if !any {
@@ -380,14 +383,25 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
     let (registry, per_file) = load_candidates(&cfg).await?;
     let dupes = registry.dupes;
     let candidates = registry.into_candidates();
-    for (path, kept) in &per_file {
-        println!("[parse ] {path:<36} {:>8} kept", fmt_n(*kept));
+    let total_mal: usize = per_file.iter().map(|(_, _, m)| m).sum();
+    for (path, kept, mal) in &per_file {
+        let note = if *mal > 0 {
+            format!(" \u{b7} {mal} declared malformed dropped")
+        } else {
+            String::new()
+        };
+        println!("[parse ] {path:<36} {:>8} kept{note}", fmt_n(*kept));
     }
     println!(
-        "[parse ] {} files \u{b7} {} unique candidates ({} dupes) in {:.1}s \u{b7} check {}",
+        "[parse ] {} files \u{b7} {} unique candidates ({} dupes{}) in {:.1}s \u{b7} check {}",
         per_file.len(),
         fmt_n(candidates.len()),
         fmt_n(dupes),
+        if total_mal > 0 {
+            format!(", {total_mal} malformed")
+        } else {
+            String::new()
+        },
         t_parse.elapsed().as_secs_f64(),
         cfg.validate.check_url,
     );
