@@ -1,6 +1,8 @@
 //! Runtime configuration, built entirely from CLI arguments (see main.rs).
 //! Plain structs here; clap flags are the user-facing surface.
 
+use std::time::Duration;
+
 use url::Url;
 
 use crate::model::Scheme;
@@ -104,6 +106,26 @@ impl Config {
         if self.validate.max_concurrent_checks == 0 {
             return Err("--concurrency must be > 0".into());
         }
+        for (name, v) in [
+            ("--timeout", self.validate.timeout),
+            ("--connect-timeout", self.validate.connect_timeout),
+        ] {
+            let ok = v.is_finite()
+                && v > 0.0
+                && Duration::try_from_secs_f64(v).is_ok_and(|d| !d.is_zero());
+            if !ok {
+                return Err(format!(
+                    "{name} must be a finite number > 0 that converts to a non-zero Duration (got {v})"
+                ));
+            }
+        }
+        if self.validate.connect_timeout > self.validate.timeout {
+            return Err(format!(
+                "--connect-timeout ({}) must not exceed --timeout ({})",
+                self.validate.connect_timeout, self.validate.timeout
+            ));
+        }
+
         Ok(())
     }
 
@@ -139,8 +161,15 @@ pub fn parse_target(raw: &str) -> Result<CheckTarget, String> {
         .port_or_known_default()
         .unwrap_or(if tls { 443 } else { 80 });
     let path = {
-        let p = u.path();
-        if p.is_empty() { "/" } else { p }.to_string()
+        let mut p = u.path().to_string();
+        if p.is_empty() {
+            p = "/".into();
+        }
+        if let Some(q) = u.query() {
+            p.push('?');
+            p.push_str(q);
+        }
+        p
     };
     Ok(CheckTarget {
         tls,
@@ -197,5 +226,89 @@ mod tests {
         assert!(t.tls && t.port == 443 && t.path == "/ip");
         assert!(parse_target("ftp://x").is_err());
         assert!(parse_target("").is_err());
+    }
+
+    #[test]
+    fn timeouts_must_be_finite_and_positive() {
+        fn config_with_timeouts(timeout: f64, connect_timeout: f64) -> Config {
+            Config {
+                inputs: vec![InputFile {
+                    path: "proxies.txt".into(),
+                    scheme: "http".into(),
+                }],
+                validate: Validate {
+                    timeout,
+                    connect_timeout,
+                    ..Validate::default()
+                },
+                ..Config::default()
+            }
+        }
+
+        for (timeout, connect_timeout) in [
+            (f64::NAN, 2.0),
+            (f64::INFINITY, 2.0),
+            (-5.0, 2.0),
+            (10.0, f64::NEG_INFINITY),
+            (0.0, 0.0),
+            (1e30, 1.0),
+            (10.0, 0.0),
+            (1e30, 1e30),
+            (1e-300, 1e-300),
+            (10.0, 1e30),
+            (10.0, 1e-300),
+        ] {
+            assert!(
+                config_with_timeouts(timeout, connect_timeout)
+                    .check()
+                    .is_err(),
+                "timeout={timeout:?}, connect_timeout={connect_timeout:?} must be rejected"
+            );
+        }
+
+        let nan_error = config_with_timeouts(f64::NAN, 2.0)
+            .check()
+            .expect_err("NaN timeout must be rejected");
+        assert!(
+            nan_error.contains("--timeout must be a finite"),
+            "unexpected NaN timeout error: {nan_error}"
+        );
+
+        let connect_overflow_error = config_with_timeouts(10.0, 1e30)
+            .check()
+            .expect_err("connect timeout overflow must be rejected");
+        assert!(
+            connect_overflow_error.contains("non-zero Duration"),
+            "connect overflow must fail conversion, not ordering: {connect_overflow_error}"
+        );
+
+        let connect_underflow_error = config_with_timeouts(10.0, 1e-300)
+            .check()
+            .expect_err("connect timeout underflow must be rejected");
+        assert!(
+            connect_underflow_error.contains("non-zero Duration"),
+            "connect underflow must fail conversion, not ordering: {connect_underflow_error}"
+        );
+
+        let ordering_error = config_with_timeouts(1.0, 2.0)
+            .check()
+            .expect_err("connect timeout exceeding total timeout must be rejected");
+        assert!(
+            ordering_error.contains("must not exceed"),
+            "ordering must fire here: {ordering_error}"
+        );
+
+        assert!(config_with_timeouts(3.0, 3.0).check().is_ok());
+        assert!(config_with_timeouts(10.0, 2.0).check().is_ok());
+    }
+
+    #[test]
+    fn target_path_keeps_query_string() {
+        let target = parse_target("https://example.org/ip?format=json").unwrap();
+        assert_eq!(target.path, "/ip?format=json");
+        assert_eq!(target.url, "https://example.org/ip?format=json");
+
+        let host_only = parse_target("https://example.org").unwrap();
+        assert_eq!(host_only.path, "/");
     }
 }

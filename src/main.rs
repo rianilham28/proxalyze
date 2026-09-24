@@ -15,7 +15,9 @@ mod output;
 mod parse;
 mod validate;
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::net::IpAddr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -25,7 +27,7 @@ use config::{Config, InputFile, detect_asn_db, split_input_spec};
 use geo::Judge;
 use model::{Candidate, ProbeResult, Registry, Stats};
 use output::{sort_records, write_out};
-use parse::parse_proxies_stats;
+use parse::{HostEntry, parse_proxies_stats};
 use validate::{CheckCfg, Validator};
 
 #[derive(Parser)]
@@ -73,6 +75,9 @@ struct Cli {
     /// Log every failed proxy with its reason (very verbose)
     #[arg(long)]
     debug: bool,
+    /// Resolve hostname:port candidates via DNS at load (one lookup per unique host)
+    #[arg(long)]
+    resolve_hostnames: bool,
 }
 
 /// Resource governor: reserve ~20% of the machine's parallelism for
@@ -132,43 +137,124 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
 
 async fn load_candidates(
     cfg: &Config,
-) -> Result<(Registry, Vec<(String, usize, usize)>), Box<dyn Error>> {
+    resolve_hostnames: bool,
+) -> Result<(Registry, Vec<(String, usize, usize, usize)>, usize, usize), Box<dyn Error>> {
+    use std::io::Read;
+
     let mut registry = Registry::new();
     let mut per_file = Vec::new();
+    let mut dns_cache: HashMap<(String, u16), Vec<IpAddr>> = HashMap::new();
+    let (mut total_resolved, mut total_unresolved) = (0, 0);
     for file in &cfg.inputs {
         let scheme = cfg.scheme_of(file).expect("validated in Config::check");
         for path in expand_inputs(&file.path)? {
-            let body = std::fs::read(&path)?;
-            let (entries, malformed) = parse_proxies_stats(&body, scheme);
+            let body = if path.as_os_str() == "-" {
+                let mut body = Vec::new();
+                std::io::stdin().read_to_end(&mut body)?;
+                body
+            } else {
+                std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?
+            };
+            let parsed = parse_proxies_stats(&body, scheme);
             let label = path.display().to_string();
-            let kept = entries
-                .into_iter()
-                .filter(|e| {
-                    registry.add(Candidate::new(
-                        e.addr,
-                        e.scheme,
-                        e.auth.clone(),
-                        label.clone(),
-                    ))
-                })
-                .count();
-            per_file.push((label, kept, malformed));
+            let mut kept = 0;
+            for e in parsed.entries {
+                if registry.add(Candidate::new(e.addr, e.scheme, e.auth, label.clone())) {
+                    kept += 1;
+                }
+            }
+            let hosts_len = parsed.hosts.len();
+            if resolve_hostnames {
+                let (resolved, unresolved, added) = resolve_host_entries(
+                    &[(&parsed.hosts, label.as_str())],
+                    &mut registry,
+                    &mut dns_cache,
+                    |host, port| {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async move {
+                                tokio::net::lookup_host((host, port))
+                                    .await
+                                    .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+                            })
+                        })
+                    },
+                );
+                kept += added;
+                total_resolved += resolved;
+                total_unresolved += unresolved;
+            }
+            per_file.push((label, kept, parsed.malformed, hosts_len));
         }
     }
-    Ok((registry, per_file))
+    Ok((registry, per_file, total_resolved, total_unresolved))
 }
 
-/// --input accepts a directory too: all its .txt files share the declared scheme.
+fn resolve_host_entries<F>(
+    groups: &[(&[HostEntry], &str)],
+    registry: &mut Registry,
+    cache: &mut HashMap<(String, u16), Vec<IpAddr>>,
+    mut resolver: F,
+) -> (usize, usize, usize)
+where
+    F: FnMut(&str, u16) -> std::io::Result<Vec<IpAddr>>,
+{
+    let (mut resolved, mut unresolved, mut added) = (0, 0, 0);
+    let mut declarations = HashSet::new();
+    for (hosts, label) in groups {
+        for host in *hosts {
+            let identity = (
+                host.host.clone(),
+                host.port,
+                host.scheme,
+                host.auth.as_ref().map(ToString::to_string),
+            );
+            if !declarations.insert(identity) {
+                continue;
+            }
+            let key = (host.host.clone(), host.port);
+            cache
+                .entry(key)
+                .or_insert_with(|| resolver(&host.host, host.port).unwrap_or_default());
+            let ips = cache.get(&(host.host.clone(), host.port)).unwrap();
+            if ips.is_empty() {
+                unresolved += 1;
+                continue;
+            }
+            resolved += 1;
+            for ip in ips {
+                let addr = std::net::SocketAddr::new(*ip, host.port);
+                if registry.add(Candidate::new(
+                    addr,
+                    host.scheme,
+                    host.auth.clone(),
+                    (*label).to_string(),
+                )) {
+                    added += 1;
+                }
+            }
+        }
+    }
+    (resolved, unresolved, added)
+}
+
 fn expand_inputs(path: &str) -> Result<Vec<std::path::PathBuf>, Box<dyn Error>> {
+    if path == "-" {
+        return Ok(vec![std::path::PathBuf::from("-")]);
+    }
     let p = std::path::Path::new(path);
     if p.is_dir() {
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(p)?
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(p)
+            .map_err(|e| format!("{}: {e}", p.display()))?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|f| f.extension().is_some_and(|x| x == "txt"))
+            .filter(|f| {
+                f.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                    matches!(x.to_ascii_lowercase().as_str(), "txt" | "lst" | "csv")
+                })
+            })
             .collect();
         files.sort();
         if files.is_empty() {
-            return Err(format!("{path}: directory has no .txt files").into());
+            return Err(format!("{path}: directory has no list files (.txt/.lst/.csv)").into());
         }
         return Ok(files);
     }
@@ -280,7 +366,7 @@ fn fmt_n(n: impl std::fmt::Display) -> String {
 
 fn summary(
     stats: &Stats,
-    per_file: &[(String, usize, usize)],
+    per_file: &[(String, usize, usize, usize)],
     per_target: &[(u64, u64, u64)],
     labels: &[String],
     records: usize,
@@ -338,14 +424,19 @@ fn summary(
     }
     qprintln!("  inputs");
     let mut any = false;
-    for (path, kept, _) in per_file {
+    for (path, kept, malformed, hosts) in per_file {
         let (live, auth, checked) = stats.by_input.get(path).copied().unwrap_or((0, 0, *kept));
-        if *kept == 0 {
+        if *kept == 0 && *hosts == 0 && *malformed == 0 {
             continue;
         }
         any = true;
+        let host_note = if *hosts > 0 {
+            format!(" \u{b7} {hosts} hostname lines")
+        } else {
+            String::new()
+        };
         qprintln!(
-            "            {path:<36} checked {:>7} \u{b7} live {:>5} ({:.1}%) \u{b7} auth-only {:>6}",
+            "            {path:<36} checked {:>7} \u{b7} live {:>5} ({:.1}%) \u{b7} auth-only {:>6}{host_note}",
             fmt_n(checked),
             fmt_n(live),
             100.0_f64 * live as f64 / checked.max(1) as f64,
@@ -375,10 +466,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .worker_threads(workers)
         .enable_all()
         .build()?;
-    rt.block_on(async_main(cfg, workers, source))
+    rt.block_on(async_main(cfg, workers, source, &cli))
 }
 
-async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<dyn Error>> {
+async fn async_main(
+    cfg: Config,
+    workers: usize,
+    wsrc: &str,
+    cli: &Cli,
+) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let judge = Judge::open(cfg.asn_db.as_deref())?;
     qprintln!(
@@ -390,20 +486,41 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
         }
     );
     let t_parse = Instant::now();
-    let (registry, per_file) = load_candidates(&cfg).await?;
+    let (registry, per_file, total_resolved, total_unresolved) =
+        load_candidates(&cfg, cli.resolve_hostnames).await?;
     let dupes = registry.dupes;
     let candidates = registry.into_candidates();
-    let total_mal: usize = per_file.iter().map(|(_, _, m)| m).sum();
-    for (path, kept, mal) in &per_file {
-        let note = if *mal > 0 {
+    let total_mal: usize = per_file.iter().map(|(_, _, m, _)| m).sum();
+    let total_hosts: usize = per_file.iter().map(|(_, _, _, h)| h).sum();
+    for (path, kept, mal, hosts) in &per_file {
+        let mut note = if *mal > 0 {
             format!(" \u{b7} {mal} declared malformed dropped")
         } else {
             String::new()
         };
+        if *hosts > 0 {
+            let suffix = if cli.resolve_hostnames {
+                format!(" \u{b7} {hosts} hostname lines")
+            } else {
+                format!(
+                    " \u{b7} {hosts} hostname lines (skipped: no DNS \u{2014} pass --resolve-hostnames)"
+                )
+            };
+            note.push_str(&suffix);
+        }
         qprintln!("[parse ] {path:<36} {:>8} kept{note}", fmt_n(*kept));
     }
+    let host_summary = if total_hosts > 0 && cli.resolve_hostnames {
+        format!(" \u{b7} {total_resolved} resolved / {total_unresolved} unresolved")
+    } else if total_hosts > 0 {
+        format!(
+            " \u{b7} {total_hosts} hostname lines (skipped: no DNS \u{2014} pass --resolve-hostnames)"
+        )
+    } else {
+        String::new()
+    };
     qprintln!(
-        "[parse ] {} files \u{b7} {} unique candidates ({} dupes{}) in {:.1}s \u{b7} check {}",
+        "[parse ] {} files \u{b7} {} unique candidates ({} dupes{}){} in {:.1}s \u{b7} check {}",
         per_file.len(),
         fmt_n(candidates.len()),
         fmt_n(dupes),
@@ -412,8 +529,9 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
         } else {
             String::new()
         },
+        host_summary,
         t_parse.elapsed().as_secs_f64(),
-        cfg.validate.check_url,
+        cfg.validate.check_url
     );
     if candidates.is_empty() {
         // a fully-unparseable or empty input is a *measurement*, not a tool
@@ -474,4 +592,72 @@ async fn async_main(cfg: Config, workers: usize, wsrc: &str) -> Result<(), Box<d
         &cfg,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::Scheme;
+    use std::cell::Cell;
+
+    fn host(name: &str, port: u16, scheme: Scheme, auth: Option<model::Auth>) -> HostEntry {
+        HostEntry {
+            host: name.to_string(),
+            port,
+            scheme,
+            auth,
+        }
+    }
+
+    #[test]
+    fn resolver_cache_reuses_host_port_across_entry_groups() {
+        let first = [host("proxy.example", 8080, Scheme::Http, None)];
+        let second = [host(
+            "proxy.example",
+            8080,
+            Scheme::Http,
+            Some(model::Auth {
+                user: "user".into(),
+                password: Some("pass".into()),
+            }),
+        )];
+        let mut registry = Registry::new();
+        let mut cache = HashMap::new();
+        let calls = Cell::new(0);
+
+        let result = resolve_host_entries(
+            &[(&first, "first"), (&second, "second")],
+            &mut registry,
+            &mut cache,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(vec!["192.0.2.10".parse().unwrap()])
+            },
+        );
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!((result.0, result.1, result.2), (2, 0, 2));
+    }
+
+    #[test]
+    fn resolver_cache_keeps_different_ports_independent() {
+        let first = [host("proxy.example", 8080, Scheme::Http, None)];
+        let second = [host("proxy.example", 8081, Scheme::Http, None)];
+        let mut registry = Registry::new();
+        let mut cache = HashMap::new();
+        let calls = Cell::new(0);
+
+        let result = resolve_host_entries(
+            &[(&first, "first"), (&second, "second")],
+            &mut registry,
+            &mut cache,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(vec!["192.0.2.10".parse().unwrap()])
+            },
+        );
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!((result.0, result.1, result.2), (2, 0, 2));
+    }
 }

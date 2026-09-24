@@ -59,30 +59,74 @@ pub fn sort_records(records: &mut [LiveRecord]) {
     });
 }
 
+#[cfg(unix)]
+fn open_opts() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true).mode(0o600);
+    opts
+}
+
+#[cfg(not(unix))]
+fn open_opts() -> std::fs::OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    opts
+}
+
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    // unique per process AND per file: with_extension("tmp") would collide
+    // proxies.txt <-> proxies.jsonl on "proxies.tmp" and across concurrent runs
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".into());
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(open_opts().open(&tmp)?);
+        // .mode() only applies on creation — a stale wide tmp from a crashed
+        // run must be tightened explicitly:
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(contents)?;
+        f.flush()?;
+        f.get_ref().sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn write_out(
     dir: &Path,
     _cfg: &Output,
     records: &[LiveRecord],
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    // Older runs wrote a proxies/ directory; the format is two files now.
-    let stale = dir.join("proxies");
-    if stale.exists() {
-        std::fs::remove_dir_all(&stale)?;
-    }
+    // Legacy proxies/ dir (pre-two-file format) is intentionally left in place: deleting an operator-named directory is not our call.
     let path = dir.join("proxies.txt");
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
-    for r in records {
-        writeln!(f, "{}", r.proxy)?;
-    }
-    f.flush()?;
-
     let jpath = dir.join("proxies.jsonl");
-    let mut jf = std::io::BufWriter::new(std::fs::File::create(&jpath)?);
+    let mut txt_bytes = Vec::new();
     for r in records {
-        serde_json::to_writer(&mut jf, r)?;
-        jf.write_all(b"\n")?;
+        txt_bytes.extend_from_slice(r.proxy.as_bytes());
+        txt_bytes.push(b'\n');
     }
-    jf.flush()?;
+    let mut jsonl_bytes = Vec::new();
+    for r in records {
+        jsonl_bytes.extend_from_slice(&serde_json::to_vec(r)?);
+        jsonl_bytes.push(b'\n');
+    }
+    write_atomic(&path, &txt_bytes)?;
+    write_atomic(&jpath, &jsonl_bytes)?;
     Ok(vec![
         path.display().to_string(),
         jpath.display().to_string(),
@@ -112,6 +156,42 @@ mod tests {
             org: None,
             tags: vec![],
         }
+    }
+
+    #[test]
+    fn output_files_are_owner_only() {
+        let dir = std::env::temp_dir().join(format!("pxz-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = rec("http", "1.2.3.4:80");
+        write_out(
+            &dir,
+            &crate::config::Output::default(),
+            std::slice::from_ref(&r),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in ["proxies.txt", "proxies.jsonl"] {
+                let mode = std::fs::metadata(dir.join(f)).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{f} mode {:o}", mode & 0o777);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrelated_proxies_dir_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("pxz-stale-{}", std::process::id()));
+        let nested = dir.join("proxies");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("keep.txt"), b"mine").unwrap();
+        write_out(&dir, &crate::config::Output::default(), &[]).unwrap();
+        assert!(
+            nested.join("keep.txt").exists(),
+            "unrelated dir was deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

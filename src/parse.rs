@@ -6,15 +6,18 @@
 //!
 //! Recognized forms (the config contract):
 //!   1.2.3.4:8080
+//!   1.2.3.4,8080
+//!   1.2.3.4:8080:user[:pass]
 //!   socks5://1.2.3.4:1080
 //!   socks5://user:pass@1.2.3.4:1080
 //!   user:pass@1.2.3.4:8080              (scheme from the file claim)
+//!   hostname.example:8080              (reported separately; no implicit DNS)
 //!   [2001:db8::1]:3128
-//!   1.2.3.0/24:8080                     CIDR /16..=/32, expanded to hosts
-//!   03.161.30.65:82                     zero-padded octets are normalized
+//!   1.2.3.0/24:8080                   CIDR /16..=/32, expanded to hosts
+//!   03.161.30.65:82                   zero-padded octets are normalized
 //!
-//! Note: passwords are matched over `[A-Za-z0-9._\-]` inside the token;
-//! exotic symbol-heavy passwords should be re-encoded at the proxy.
+//! Credential characters are preserved exactly except for the structural
+//! delimiters required to identify each supported format.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -28,156 +31,329 @@ pub struct Entry {
     pub auth: Option<Auth>,
 }
 
-/// Parse only — malformed declared lines are folded away. Test convenience
-/// over [`parse_proxies_stats`] (which the CLI uses for the drop log).
-#[cfg(test)]
-pub fn parse_proxies(body: &[u8], claim: Scheme) -> Vec<Entry> {
-    parse_proxies_stats(body, claim).0
+#[derive(Debug, PartialEq, Eq)]
+pub struct HostEntry {
+    pub host: String,
+    pub port: u16,
+    pub scheme: Scheme,
+    pub auth: Option<Auth>,
 }
 
-/// Second value = lines that *declared* a proxy (valid `scheme://` or
-/// `user:pass@`) but whose address failed to parse — e.g. hostnames (out of
-/// contract: no DNS) or octets > 255. Only prefixed forms count: a scheme
-/// prefix is an explicit declaration; bare tokens are candidate sightings,
-/// and random text must never inflate the number.
-pub fn parse_proxies_stats(body: &[u8], claim: Scheme) -> (Vec<Entry>, usize) {
-    let mut out: Vec<Entry> = Vec::new();
-    let mut malformed = 0usize;
-    scan_prefixed(body, claim, &mut out, &mut malformed);
-    // A bare re-sighting of an address already explained by a prefixed line
-    // (`scheme://…` or `user:pass@…`) is a substring artifact of that very
-    // line, not a second declaration — checking the phantom would double-
-    // probe credentialed entries and mislabel scheme-prefixed ones under the
-    // file claim. Set-based: real-world lists run 100k+ prefixed lines, and
-    // a per-candidate linear scan is quadratic on exactly that input.
-    let mut seen: HashSet<SocketAddr> = out.iter().map(|e| e.addr).collect();
-    for (addr, _) in scan_bare(body) {
-        if seen.insert(addr) {
-            out.push(Entry {
+#[derive(Debug)]
+pub struct Parsed {
+    pub entries: Vec<Entry>,
+    pub malformed: usize,
+    pub hosts: Vec<HostEntry>,
+}
+
+#[cfg(test)]
+pub fn parse_proxies(body: &[u8], claim: Scheme) -> Vec<Entry> {
+    parse_proxies_stats(body, claim).entries
+}
+
+pub fn parse_proxies_stats(body: &[u8], claim: Scheme) -> Parsed {
+    let body = strip_comments(body);
+    let (mut entries, mut malformed, mut hosts) = (Vec::new(), 0, Vec::new());
+    let rejected = scan_prefixed(&body, claim, &mut entries, &mut hosts, &mut malformed);
+    let prefixed_addrs: HashSet<SocketAddr> =
+        entries.iter().map(|e| e.addr).chain(rejected).collect();
+    let mut seen: HashSet<(SocketAddr, Scheme, Option<String>)> = entries
+        .iter()
+        .map(|e| (e.addr, e.scheme, e.auth.as_ref().map(ToString::to_string)))
+        .collect();
+    for (addr, auth) in scan_bare(&body) {
+        if auth.is_none() && prefixed_addrs.contains(&addr) {
+            continue;
+        }
+        let key = (addr, claim, auth.as_ref().map(ToString::to_string));
+        if seen.insert(key) {
+            entries.push(Entry {
                 addr,
                 scheme: claim,
-                auth: None,
+                auth,
             });
         }
     }
-    (out, malformed)
+    hosts.extend(scan_host_lines(&body, claim));
+    Parsed {
+        entries,
+        malformed,
+        hosts,
+    }
 }
 
-/// Letter-aware pass: tokens containing `://` (scheme + optional creds) or
-/// `@ip:port` (creds + file claim).
-fn scan_prefixed(body: &[u8], claim: Scheme, out: &mut Vec<Entry>, mal: &mut usize) {
-    // brackets included: scheme-prefixed IPv6 (`socks5://[v6]:1080`) and
-    // credentialed IPv6 (`user:pass@[v6]:8080`) are real list shapes
-    let keep = |b: u8| {
-        b.is_ascii_alphanumeric()
-            || matches!(b, b'.' | b':' | b'/' | b'@' | b'-' | b'_' | b'[' | b']')
-    };
-    let mut start = None::<usize>;
-    let mut flush = |s: Option<usize>, e: usize, out: &mut Vec<Entry>| {
-        let Some(s) = s else { return };
-        let tok = String::from_utf8_lossy(&body[s..e]).to_ascii_lowercase();
-        if let Some((sch, rest)) = tok.split_once("://") {
-            let Some(scheme) = Scheme::from_claim(sch) else {
-                return;
-            };
-            let (auth, hostport) = split_auth(rest);
-            if let Some(addr) = parse_addr_str(hostport.split('/').next().unwrap_or(hostport)) {
-                out.push(Entry { addr, scheme, auth });
-            } else if proxy_ish(hostport.split('/').next().unwrap_or(hostport)) {
-                *mal += 1;
+fn strip_comments(body: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+    if !lines.iter().any(|l| {
+        l.iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|&b| matches!(b, b'#' | b';'))
+    }) {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let is_comment = line
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|&b| matches!(b, b'#' | b';'));
+        if !is_comment {
+            out.extend_from_slice(line);
+            if i + 1 < lines.len() {
+                out.push(b'\n');
             }
-        } else if tok.contains('@') {
-            let (auth, hostport) = split_auth(&tok);
-            if auth.is_some() {
-                if let Some(addr) = parse_addr_str(hostport) {
-                    out.push(Entry {
-                        addr,
-                        scheme: claim,
-                        auth,
-                    });
-                } else if proxy_ish(hostport) {
-                    *mal += 1;
-                }
-            }
-        }
-    };
-    for (i, &b) in body.iter().enumerate() {
-        if keep(b) {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start.take() {
-            flush(Some(s), i, out);
         }
     }
-    if let Some(s) = start {
-        flush(Some(s), body.len(), out);
+    std::borrow::Cow::Owned(out)
+}
+
+fn scan_prefixed(
+    body: &[u8],
+    claim: Scheme,
+    out: &mut Vec<Entry>,
+    hosts: &mut Vec<HostEntry>,
+    mal: &mut usize,
+) -> HashSet<SocketAddr> {
+    let mut rejected = HashSet::new();
+    let keep = |b: u8| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'.' | b':'
+                    | b'/'
+                    | b'@'
+                    | b'-'
+                    | b'_'
+                    | b'['
+                    | b']'
+                    | b'+'
+                    | b'='
+                    | b'%'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'&'
+                    | b'*'
+                    | b'('
+                    | b')'
+                    | b'~'
+            )
+    };
+    let mut start = None;
+    for i in 0..=body.len() {
+        if i < body.len() && keep(body[i]) {
+            start.get_or_insert(i);
+            continue;
+        }
+        let Some(s) = start.take() else { continue };
+        let tok = String::from_utf8_lossy(&body[s..i]);
+        let (scheme, rest, has_scheme_prefix) = if let Some((sch, rest)) = tok.split_once("://") {
+            let Some(scheme) = Scheme::from_claim(sch) else {
+                continue;
+            };
+            (scheme, rest, true)
+        } else if tok.contains('@') {
+            (claim, tok.as_ref(), false)
+        } else {
+            continue;
+        };
+        let (auth, hostport) = split_auth(rest);
+        let hostport = hostport.split('/').next().unwrap_or(hostport);
+        let hostport = hostport.split_once('#').map_or(hostport, |(host, _)| host);
+        if !has_scheme_prefix {
+            rejected.extend(parse_addr_str(hostport));
+            if rest
+                .rsplit_once('@')
+                .is_none_or(|(creds, _)| !creds.contains(':'))
+            {
+                continue;
+            }
+            if auth.is_none() {
+                continue;
+            }
+        }
+        if let Some(addr) = parse_addr_str(hostport) {
+            out.push(Entry { addr, scheme, auth });
+        } else if proxy_ish(hostport) {
+            push_unresolved(hostport, scheme, auth, hosts, mal);
+        }
+    }
+    rejected
+}
+
+fn push_unresolved(
+    hp: &str,
+    scheme: Scheme,
+    auth: Option<Auth>,
+    hosts: &mut Vec<HostEntry>,
+    mal: &mut usize,
+) {
+    let Some((host, port)) = hp.rsplit_once(':') else {
+        *mal += 1;
+        return;
+    };
+    if host.bytes().any(|b| b.is_ascii_alphabetic())
+        && !host.contains(':')
+        && let Ok(port) = port.parse::<u16>()
+        && (1..=65535).contains(&port)
+    {
+        hosts.push(HostEntry {
+            host: host.to_ascii_lowercase(),
+            port,
+            scheme,
+            auth,
+        });
+    } else {
+        *mal += 1;
     }
 }
 
 fn split_auth(s: &str) -> (Option<Auth>, &str) {
     match s.rsplit_once('@') {
-        Some((creds, hostport)) => {
-            let (user, pass) = match creds.split_once(':') {
+        Some((creds, hp)) => {
+            let (user, password) = match creds.split_once(':') {
                 Some((u, p)) => (u.to_string(), Some(p.to_string())),
                 None => (creds.to_string(), None),
             };
             if user.is_empty() {
-                (None, hostport)
+                (None, hp)
             } else {
-                (
-                    Some(Auth {
-                        user,
-                        password: pass,
-                    }),
-                    hostport,
-                )
+                (Some(Auth { user, password }), hp)
             }
         }
         None => (None, s),
     }
 }
 
-/// Numeric pass for bare `ip:port`, `[v6]:port`, and CIDR ranges.
 fn scan_bare(body: &[u8]) -> Vec<(SocketAddr, Option<Auth>)> {
     let mut out = Vec::new();
-    let mut start = None::<usize>;
-    let keep = |b: u8| matches!(b, b'0'..=b'9' | b'.' | b':' | b'/' | b'[' | b']' | b'a'..=b'f' | b'A'..=b'F');
-    for (i, &b) in body.iter().enumerate() {
-        match start {
-            None if keep(b) => start = Some(i),
-            Some(s) if !keep(b) => {
-                extend_token(&body[s..i], &mut out);
-                start = None;
-            }
-            _ => {}
+    let mut start = None;
+    let keep = |b: u8| {
+        b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'/' | b'[' | b']' | b',' | b'-')
+    };
+    for i in 0..=body.len() {
+        if i < body.len() && keep(body[i]) {
+            start.get_or_insert(i);
+        } else if let Some(s) = start.take() {
+            extend_token(&body[s..i], &mut out);
         }
-    }
-    if let Some(s) = start {
-        extend_token(&body[s..], &mut out);
     }
     out
 }
 
 fn extend_token(tok: &[u8], out: &mut Vec<(SocketAddr, Option<Auth>)>) {
-    let t = String::from_utf8_lossy(tok).to_ascii_lowercase();
-    let rest = t.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(&t);
-    if let Some(addr) = parse_addr_str(rest) {
+    let t = String::from_utf8_lossy(tok);
+    if let Some(addr) = parse_addr_str(&t) {
         out.push((addr, None));
         return;
     }
-    if let Some((cidr, port)) = rest.split_once(':')
+    if let Some((cidr, port)) = t.split_once(':')
         && let Some((net, prefix)) = cidr.split_once('/')
     {
         let prefix: u8 = prefix.parse().unwrap_or(64);
         if let (Some(net), Ok(port)) = (parse_v4_lenient(net), port.parse::<u16>())
             && (16..=32).contains(&prefix)
         {
-            for host in expand_v4(net, prefix) {
-                out.push((SocketAddr::new(host, port), None));
+            for h in expand_v4(net, prefix) {
+                out.push((SocketAddr::new(h, port), None));
             }
+            return;
         }
     }
+    if let Some((ip, port)) = t.split_once(',')
+        && parse_v4_lenient(ip).is_some()
+        && let Ok(port) = port.parse::<u16>()
+    {
+        if let Some(a) = parse_addr_str(&format!("{ip}:{port}")) {
+            out.push((a, None));
+        }
+        return;
+    }
+    let p: Vec<&str> = t.splitn(4, ':').collect();
+    if (p.len() == 3 || p.len() == 4)
+        && let Some(a) = parse_addr_str(&format!("{}:{}", p[0], p[1]))
+        && !p[2].is_empty()
+    {
+        out.push((
+            a,
+            Some(Auth {
+                user: p[2].to_string(),
+                password: p
+                    .get(3)
+                    .and_then(|x| (!x.is_empty()).then(|| (*x).to_string())),
+            }),
+        ));
+        return;
+    }
+    if t.contains(',') {
+        for cell in t.split(',') {
+            extend_cell(cell, out);
+        }
+    }
+}
+
+fn extend_cell(t: &str, out: &mut Vec<(SocketAddr, Option<Auth>)>) {
+    if let Some(a) = parse_addr_str(t) {
+        out.push((a, None));
+        return;
+    }
+    let p: Vec<&str> = t.splitn(4, ':').collect();
+    if (p.len() == 3 || p.len() == 4)
+        && let Some(a) = parse_addr_str(&format!("{}:{}", p[0], p[1]))
+        && !p[2].is_empty()
+    {
+        out.push((
+            a,
+            Some(Auth {
+                user: p[2].to_string(),
+                password: p
+                    .get(3)
+                    .and_then(|x| (!x.is_empty()).then(|| (*x).to_string())),
+            }),
+        ));
+    }
+}
+
+fn scan_host_lines(body: &[u8], claim: Scheme) -> Vec<HostEntry> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in body.split(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(raw);
+        let line = line.trim();
+        if line.is_empty()
+            || line.contains("://")
+            || line.contains('@')
+            || line.split_whitespace().count() != 1
+        {
+            continue;
+        }
+        let Some((host, port_s)) = line.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port_s.parse::<u16>() else {
+            continue;
+        };
+        if !(1..=65535).contains(&port) {
+            continue;
+        }
+        if host.is_empty()
+            || host.contains(':')
+            || !host.bytes().any(|b| b.is_ascii_alphabetic())
+            || host.parse::<IpAddr>().is_ok()
+            || !proxy_ish(line)
+        {
+            continue;
+        }
+        if seen.insert((host.to_ascii_lowercase(), port, claim)) {
+            out.push(HostEntry {
+                host: host.to_ascii_lowercase(),
+                port,
+                scheme: claim,
+                auth: None,
+            });
+        }
+    }
+    out
 }
 
 fn expand_v4(net: Ipv4Addr, prefix: u8) -> Vec<IpAddr> {
@@ -328,12 +504,162 @@ mod tests {
             see http://example.com/path for docs\n\
             random text, not a proxy\n"
             .as_bytes();
-        let (out, mal) = parse_proxies_stats(body, Scheme::Http);
-        assert!(out.is_empty(), "got {out:?}");
+        let p = parse_proxies_stats(body, Scheme::Http);
+        assert!(p.entries.is_empty(), "got {:?}", p.entries);
+        assert_eq!(p.malformed, 2, "octet256 + octet999; URL prose uncounted");
+        assert_eq!(p.hosts.len(), 1, "hostname is reported, not malformed");
+    }
+
+    #[test]
+    fn credentials_keep_their_case() {
+        let out = parse_proxies(b"http://Admin:Secret@1.2.3.4:80\n", Scheme::Http);
+        let a = out[0].auth.as_ref().unwrap();
         assert_eq!(
-            mal, 3,
-            "hostname + octet256 + octet999; URLs/noise uncounted"
+            (a.user.as_str(), a.password.as_deref()),
+            ("Admin", Some("Secret"))
         );
+    }
+
+    #[test]
+    fn comment_lines_are_never_probed() {
+        let body = b"# 9.9.9.9:3128\n; socks5://1.2.3.4:1080\n1.2.3.4:8080\n";
+        let p = parse_proxies_stats(body, Scheme::Http);
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.malformed, 0);
+        assert!(p.hosts.is_empty());
+    }
+
+    #[test]
+    fn unterminated_comment_lines_are_ignored() {
+        for body in [
+            b"# 9.9.9.9:3128".as_slice(),
+            b"; socks5://1.2.3.4:1080".as_slice(),
+        ] {
+            let p = parse_proxies_stats(body, Scheme::Http);
+            assert!(p.entries.is_empty(), "got {:?}", p.entries);
+            assert_eq!(p.malformed, 0);
+            assert!(p.hosts.is_empty(), "got {:?}", p.hosts);
+        }
+    }
+
+    #[test]
+    fn host_port_boundaries_are_enforced() {
+        let invalid = parse_proxies_stats(b"proxy.example.net:0", Scheme::Socks5);
+        assert!(invalid.entries.is_empty());
+        assert_eq!(invalid.malformed, 0);
+        assert!(invalid.hosts.is_empty());
+
+        let valid = parse_proxies_stats(b"host.example.net:65535", Scheme::Socks5);
+        assert!(valid.entries.is_empty());
+        assert_eq!(valid.malformed, 0);
+        assert_eq!(valid.hosts.len(), 1);
+        assert_eq!(valid.hosts[0].port, 65535);
+    }
+
+    #[test]
+    fn symbol_passwords_are_preserved_not_rewritten() {
+        let out = parse_proxies(b"user:p+ss#1@1.2.3.4:80\n", Scheme::Http);
+        let a = out[0].auth.as_ref().unwrap();
+        assert_eq!(
+            (a.user.as_str(), a.password.as_deref()),
+            ("user", Some("p+ss#1"))
+        );
+    }
+
+    #[test]
+    fn colon_quad_and_csv_formats_parse() {
+        let p = parse_proxies_stats(b"1.2.3.4:8080:root:sec:ret\n5.6.7.8,8080\n", Scheme::Http);
+        assert_eq!(p.entries.len(), 2);
+        let a = p.entries[0].auth.as_ref().unwrap();
+        assert_eq!(
+            (a.user.as_str(), a.password.as_deref()),
+            ("root", Some("sec:ret"))
+        );
+    }
+
+    #[test]
+    fn bare_colon_quad_credentials_keep_their_case() {
+        let out = parse_proxies(b"1.2.3.4:8080:Admin:Secret\n", Scheme::Http);
+        let a = out[0].auth.as_ref().unwrap();
+        assert_eq!(
+            (a.user.as_str(), a.password.as_deref()),
+            ("Admin", Some("Secret"))
+        );
+    }
+    #[test]
+    fn mixed_plain_and_bare_auth_preserve_both_entries() {
+        for body in [
+            b"1.2.3.4:8080\n1.2.3.4:8080:user:pass\n".as_slice(),
+            b"1.2.3.4:8080:user:pass\n1.2.3.4:8080\n".as_slice(),
+        ] {
+            let out = parse_proxies(body, Scheme::Http);
+            assert_eq!(out.len(), 2);
+            assert_eq!(out.iter().filter(|e| e.auth.is_none()).count(), 1);
+            let auth = out.iter().find_map(|e| e.auth.as_ref()).unwrap();
+            assert_eq!(
+                (auth.user.as_str(), auth.password.as_deref()),
+                ("user", Some("pass"))
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_and_bare_auth_lines_remain_distinct_entries() {
+        let parsed = parse_proxies_stats(
+            b"http://user:pass@1.2.3.4:80\n1.2.3.4:80:user:pass\n",
+            Scheme::Socks5,
+        );
+        assert_eq!(parsed.entries.len(), 2);
+
+        let repeated = parse_proxies_stats(
+            b"1.2.3.4:80:user:pass\n1.2.3.4:80:user:pass\n",
+            Scheme::Socks5,
+        );
+        assert_eq!(repeated.entries.len(), 1);
+    }
+    #[test]
+    fn incomplete_credentials_are_rejected_without_side_channels() {
+        for body in [
+            b"user@1.2.3.4:80\n".as_slice(),
+            b":secret@1.2.3.4:80\n".as_slice(),
+        ] {
+            let parsed = parse_proxies_stats(body, Scheme::Http);
+            assert_eq!(
+                (parsed.entries.len(), parsed.malformed, parsed.hosts.len()),
+                (0, 0, 0),
+                "got {parsed:?}",
+            );
+        }
+
+        let valid = parse_proxies_stats(b"http://1.2.3.4:80\n", Scheme::Http);
+        assert_eq!(valid.entries.len(), 1);
+    }
+
+    #[test]
+    fn prefixed_hostname_ports_enforce_valid_range() {
+        let invalid = parse_proxies_stats(b"socks5://proxy.example.net:0", Scheme::Http);
+        assert_eq!(
+            (invalid.hosts.len(), invalid.malformed),
+            (0, 1),
+            "got {invalid:?}",
+        );
+
+        let valid = parse_proxies_stats(b"socks5://proxy.example.net:65535", Scheme::Http);
+        assert_eq!(
+            (valid.hosts.len(), valid.malformed),
+            (1, 0),
+            "got {valid:?}",
+        );
+    }
+
+    #[test]
+    fn bare_hostnames_are_reported_not_swallowed() {
+        let p = parse_proxies_stats(b"proxy.provider-a.net:4145\n", Scheme::Socks5);
+        assert!(p.entries.is_empty());
+        assert_eq!(p.malformed, 0);
+        assert_eq!(p.hosts.len(), 1);
+        assert_eq!(p.hosts[0].host, "proxy.provider-a.net");
+        assert_eq!(p.hosts[0].scheme, Scheme::Socks5);
     }
 
     #[test]
