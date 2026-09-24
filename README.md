@@ -97,11 +97,16 @@ set:
 - bare four-field `ip:port:user:pass` accepts ASCII alphanumerics plus
   `. : / [ ] , - _ + = % ! # $ & * ( ) ~`.
 
-Whitespace, semicolons, and quote characters are unsupported in both forms and
-must be re-encoded at the proxy. A comma is accepted in the remainder of a bare
-four-field password, but not in a scheme-prefixed or `@` form. Any character
-outside the applicable set can split the token and silently rewrite or truncate
-the credential, so re-encode it at the proxy.
+Whitespace, semicolons, and quote characters are unsupported inside credentials
+in both forms and must be re-encoded at the proxy. A comma is accepted in the
+remainder of a bare four-field password, but not in a scheme-prefixed or `@`
+form. Any character outside the applicable set can split the token and silently
+rewrite or truncate the credential, so re-encode it at the proxy.
+
+Separate proxy entries with whitespace or newlines. A comma separates the two
+parts of a strict `ip,port` pair, but is credential data in a four-field quad:
+`1.2.3.4:8080:user:p,ass` keeps `p,ass` intact, and a second proxy glued after
+that quad with no whitespace would also be consumed as password data.
 
 ## Incremental and CI modes
 
@@ -211,7 +216,7 @@ misreported as proxy latency.
 ## Development
 
 ```
-cargo test --locked             # 95 tests, no network (unit + hermetic localhost-mock e2e)
+cargo test --locked             # 118 tests, no network (unit + hermetic localhost-mock e2e)
 cargo clippy --all-targets -- -D warnings
 ```
 

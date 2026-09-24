@@ -40,6 +40,7 @@ use crate::config::{CheckTarget, Validate};
 use crate::model::{Auth, Candidate, ProbeResult, Scheme};
 
 const MAX_BODY: usize = 64 * 1024;
+const OVERSIZED_RESPONSE: &str = "oversized response";
 
 /// stderr write that never panics when the display pipe is closed.
 macro_rules! qeprintln {
@@ -392,7 +393,7 @@ impl Validator {
             Err(fail) => {
                 let mut r = self.blank(c, fail.0, start, connected, slot_idx as i16);
                 r.proxy = proxy_label(c);
-                if fail.1.starts_with("target status") {
+                if fail.1.starts_with("target status") || fail.1 == OVERSIZED_RESPONSE {
                     slot.errors.fetch_add(1, Ordering::Relaxed);
                 }
                 r.connect_ms = connected.duration_since(start).as_millis() as u32;
@@ -527,7 +528,12 @@ impl Validator {
                         )
                         .await
                     }
-                    None => tokio_socks::tcp::Socks5Stream::connect_with_socket(tcp, target).await,
+                    None => {
+                        tokio_socks::tcp::Socks5Stream::connect_with_password_and_socket(
+                            tcp, target, &a.user, "",
+                        )
+                        .await
+                    }
                 },
                 _ => tokio_socks::tcp::Socks5Stream::connect_with_socket(tcp, target).await,
             }
@@ -859,7 +865,7 @@ impl Validator {
         };
         let (_status, body) = match outcome {
             Ok(v) => v,
-            Err(_) => return Shape::Unreachable,
+            Err(fail) => return shape_from_read_error(fail),
         };
         let text = String::from_utf8_lossy(&body).trim().to_string();
         match extract_origin(&text) {
@@ -873,7 +879,7 @@ impl Validator {
                 None => Shape::Wrong(format!("no address in: {o}")),
             },
             None if text.is_empty() => Shape::Unreachable,
-            None => Shape::Wrong(format!("body starts {:?}", &text[..text.len().min(24)])),
+            None => Shape::Wrong(format!("body starts {:?}", body_preview(&text))),
         }
     }
 
@@ -905,7 +911,7 @@ impl Validator {
                 let frame = item.map_err(|e| ("tcp-alive", e.to_string()))?;
                 if let Ok(data) = frame.into_data() {
                     if buf.len() + data.len() > MAX_BODY {
-                        return Err::<_, Fail>(("tcp-alive", "oversized response".into()));
+                        return Err::<_, Fail>(("tcp-alive", OVERSIZED_RESPONSE.into()));
                     }
                     buf.extend_from_slice(&data);
                 }
@@ -937,6 +943,18 @@ fn authority_of(t: &CheckTarget) -> String {
         t.host.clone()
     } else {
         format!("{}:{}", t.host, t.port)
+    }
+}
+
+fn body_preview(text: &str) -> String {
+    text.chars().take(24).collect()
+}
+
+fn shape_from_read_error(fail: Fail) -> Shape {
+    if fail.1 == OVERSIZED_RESPONSE {
+        Shape::Wrong(OVERSIZED_RESPONSE.into())
+    } else {
+        Shape::Unreachable
     }
 }
 
@@ -1368,5 +1386,23 @@ mod tests {
         assert_eq!(b64("bob:s3cret-9"), "Ym9iOnMzY3JldC05");
         assert_eq!(b64("ab"), "YWI=");
         assert_eq!(b64("abc"), "YWJj");
+    }
+
+    #[test]
+    fn body_preview_counts_chars_at_multibyte_boundary() {
+        let body = format!("{}☃{}", "é".repeat(12), "x".repeat(20));
+        let expected = format!("{}☃{}", "é".repeat(12), "x".repeat(11));
+
+        assert_eq!(body_preview(&body), expected);
+    }
+
+    #[test]
+    fn oversized_read_once_response_has_wrong_shape() {
+        let shape = shape_from_read_error(("tcp-alive", "oversized response".into()));
+
+        assert!(
+            matches!(shape, Shape::Wrong(detail) if detail == "oversized response"),
+            "an oversized reachable response is a wrong body shape, not unreachable"
+        );
     }
 }

@@ -19,7 +19,7 @@
 //! Credential characters are preserved exactly except for the structural
 //! delimiters required to identify each supported format.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::model::{Auth, Scheme};
@@ -54,16 +54,23 @@ pub fn parse_proxies(body: &[u8], claim: Scheme) -> Vec<Entry> {
 pub fn parse_proxies_stats(body: &[u8], claim: Scheme) -> Parsed {
     let body = strip_comments(body);
     let (mut entries, mut malformed, mut hosts) = (Vec::new(), 0, Vec::new());
-    let rejected = scan_prefixed(&body, claim, &mut entries, &mut hosts, &mut malformed);
-    let prefixed_addrs: HashSet<SocketAddr> =
-        entries.iter().map(|e| e.addr).chain(rejected).collect();
+    let mut rejected = scan_prefixed(&body, claim, &mut entries, &mut hosts, &mut malformed);
+    let kept_addrs: HashSet<SocketAddr> = entries.iter().map(|e| e.addr).collect();
     let mut seen: HashSet<(SocketAddr, Scheme, Option<String>)> = entries
         .iter()
         .map(|e| (e.addr, e.scheme, e.auth.as_ref().map(ToString::to_string)))
         .collect();
     for (addr, auth) in scan_bare(&body) {
-        if auth.is_none() && prefixed_addrs.contains(&addr) {
-            continue;
+        if auth.is_none() {
+            if kept_addrs.contains(&addr) {
+                continue;
+            }
+            if let Some(count) = rejected.get_mut(&addr)
+                && *count > 0
+            {
+                *count -= 1;
+                continue;
+            }
         }
         let key = (addr, claim, auth.as_ref().map(ToString::to_string));
         if seen.insert(key) {
@@ -75,6 +82,15 @@ pub fn parse_proxies_stats(body: &[u8], claim: Scheme) -> Parsed {
         }
     }
     hosts.extend(scan_host_lines(&body, claim));
+    let mut host_seen = HashSet::new();
+    hosts.retain(|host| {
+        host_seen.insert((
+            host.host.clone(),
+            host.port,
+            host.scheme,
+            host.auth.as_ref().map(ToString::to_string),
+        ))
+    });
     Parsed {
         entries,
         malformed,
@@ -113,8 +129,8 @@ fn scan_prefixed(
     out: &mut Vec<Entry>,
     hosts: &mut Vec<HostEntry>,
     mal: &mut usize,
-) -> HashSet<SocketAddr> {
-    let mut rejected = HashSet::new();
+) -> HashMap<SocketAddr, usize> {
+    let mut rejected = HashMap::new();
     let keep = |b: u8| {
         b.is_ascii_alphanumeric()
             || matches!(
@@ -161,14 +177,14 @@ fn scan_prefixed(
         let hostport = hostport.split('/').next().unwrap_or(hostport);
         let hostport = hostport.split_once('#').map_or(hostport, |(host, _)| host);
         if !has_scheme_prefix {
-            rejected.extend(parse_addr_str(hostport));
-            if rest
+            let valid = rest
                 .rsplit_once('@')
-                .is_none_or(|(creds, _)| !creds.contains(':'))
-            {
-                continue;
-            }
-            if auth.is_none() {
+                .is_some_and(|(creds, _)| creds.contains(':'))
+                && auth.is_some();
+            if !valid {
+                if let Some(addr) = parse_addr_str(hostport) {
+                    *rejected.entry(addr).or_default() += 1;
+                }
                 continue;
             }
         }
@@ -263,76 +279,68 @@ fn scan_bare(body: &[u8]) -> Vec<(SocketAddr, Option<Auth>)> {
 }
 
 fn extend_token(tok: &[u8], out: &mut Vec<(SocketAddr, Option<Auth>)>) {
-    let t = String::from_utf8_lossy(tok);
-    if let Some(addr) = parse_addr_str(&t) {
-        out.push((addr, None));
+    let token = String::from_utf8_lossy(tok);
+    if extend_token_once(&token, out) {
         return;
     }
-    if let Some((cidr, port)) = t.split_once(':')
+    for fragment in token.split(|byte: char| {
+        !(byte.is_ascii_digit()
+            || matches!(byte, '.' | ':' | '/' | '[' | ']' | 'a'..='f' | 'A'..='F'))
+    }) {
+        extend_token_once(fragment, out);
+    }
+}
+
+fn extend_token_once(token: &str, out: &mut Vec<(SocketAddr, Option<Auth>)>) -> bool {
+    if let Some(addr) = parse_addr_str(token) {
+        out.push((addr, None));
+        return true;
+    }
+    if let Some((cidr, port)) = token.split_once(':')
         && let Some((net, prefix)) = cidr.split_once('/')
     {
         let prefix: u8 = prefix.parse().unwrap_or(64);
         if let (Some(net), Ok(port)) = (parse_v4_lenient(net), port.parse::<u16>())
             && (16..=32).contains(&prefix)
         {
-            for h in expand_v4(net, prefix) {
-                out.push((SocketAddr::new(h, port), None));
+            for host in expand_v4(net, prefix) {
+                out.push((SocketAddr::new(host, port), None));
             }
-            return;
+            return true;
         }
     }
-    if let Some((ip, port)) = t.split_once(',')
-        && parse_v4_lenient(ip).is_some()
+    if let Some((ip, port)) = token.split_once(',')
         && let Ok(port) = port.parse::<u16>()
+        && let Some(addr) = parse_addr_str(&format!("{ip}:{port}"))
     {
-        if let Some(a) = parse_addr_str(&format!("{ip}:{port}")) {
-            out.push((a, None));
-        }
-        return;
+        out.push((addr, None));
+        return true;
     }
-    let p: Vec<&str> = t.splitn(4, ':').collect();
-    if (p.len() == 3 || p.len() == 4)
-        && let Some(a) = parse_addr_str(&format!("{}:{}", p[0], p[1]))
-        && !p[2].is_empty()
+    let pieces: Vec<&str> = token.splitn(4, ':').collect();
+    if (pieces.len() == 3 || pieces.len() == 4)
+        && let Some(addr) = parse_addr_str(&format!("{}:{}", pieces[0], pieces[1]))
+        && !pieces[2].is_empty()
     {
+        let password = pieces
+            .get(3)
+            .and_then(|value| (!value.is_empty()).then(|| (*value).to_string()));
         out.push((
-            a,
+            addr,
             Some(Auth {
-                user: p[2].to_string(),
-                password: p
-                    .get(3)
-                    .and_then(|x| (!x.is_empty()).then(|| (*x).to_string())),
+                user: pieces[2].to_string(),
+                password,
             }),
         ));
-        return;
+        return true;
     }
-    if t.contains(',') {
-        for cell in t.split(',') {
-            extend_cell(cell, out);
+    if token.contains(',') {
+        let before = out.len();
+        for cell in token.split(',') {
+            extend_token_once(cell, out);
         }
+        return out.len() != before;
     }
-}
-
-fn extend_cell(t: &str, out: &mut Vec<(SocketAddr, Option<Auth>)>) {
-    if let Some(a) = parse_addr_str(t) {
-        out.push((a, None));
-        return;
-    }
-    let p: Vec<&str> = t.splitn(4, ':').collect();
-    if (p.len() == 3 || p.len() == 4)
-        && let Some(a) = parse_addr_str(&format!("{}:{}", p[0], p[1]))
-        && !p[2].is_empty()
-    {
-        out.push((
-            a,
-            Some(Auth {
-                user: p[2].to_string(),
-                password: p
-                    .get(3)
-                    .and_then(|x| (!x.is_empty()).then(|| (*x).to_string())),
-            }),
-        ));
-    }
+    false
 }
 
 fn scan_host_lines(body: &[u8], claim: Scheme) -> Vec<HostEntry> {
@@ -597,6 +605,59 @@ mod tests {
             ("root", Some("sec:ret"))
         );
     }
+    #[test]
+    fn hyphen_suffix_without_credentials_is_auth_less() {
+        let out = parse_proxies(b"1.2.3.4:8080-us", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addr, "1.2.3.4:8080".parse().unwrap());
+        assert_eq!(out[0].auth, None);
+    }
+
+    #[test]
+    fn hyphen_suffix_preserves_colon_credentials() {
+        let out = parse_proxies(b"1.2.3.4:8080:user:pa-ss", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addr, "1.2.3.4:8080".parse().unwrap());
+        let auth = out[0].auth.as_ref().unwrap();
+        assert_eq!(
+            (auth.user.as_str(), auth.password.as_deref()),
+            ("user", Some("pa-ss"))
+        );
+    }
+
+    #[test]
+    fn country_suffix_falls_back_to_bare_base_once() {
+        let out = parse_proxies(b"1.2.3.4:8080US", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addr.to_string(), "1.2.3.4:8080");
+        assert_eq!(out[0].auth, None);
+    }
+
+    #[test]
+    fn alphabetic_label_suffix_falls_back_to_bare_base_once() {
+        let out = parse_proxies(b"1.2.3.4:8080XYZ", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addr.to_string(), "1.2.3.4:8080");
+        assert_eq!(out[0].auth, None);
+    }
+
+    #[test]
+    fn lowercase_alphabetic_suffix_is_rejected() {
+        let out = parse_proxies(b"1.2.3.4:8080ab", Scheme::Http);
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn credentialed_alphabetic_label_suffix_preserves_auth() {
+        let out = parse_proxies(b"1.2.3.4:8080:user:paXYZss", Scheme::Http);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].addr.to_string(), "1.2.3.4:8080");
+        let auth = out[0].auth.as_ref().unwrap();
+        assert_eq!(
+            (auth.user.as_str(), auth.password.as_deref()),
+            ("user", Some("paXYZss"))
+        );
+    }
 
     #[test]
     fn bare_colon_quad_credentials_keep_their_case() {
@@ -677,6 +738,53 @@ mod tests {
         let valid = parse_proxies_stats(b"http://1.2.3.4:80\n", Scheme::Http);
         assert_eq!(valid.entries.len(), 1);
     }
+    #[test]
+    fn rejected_credential_prefix_does_not_suppress_valid_bare_entry() {
+        assert_eq!(
+            parse_proxies(b"user@1.2.3.4:80\n1.2.3.4:80\n", Scheme::Http,),
+            vec![Entry {
+                addr: "1.2.3.4:80".parse().unwrap(),
+                scheme: Scheme::Http,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn repeated_rejected_credentials_do_not_create_entries() {
+        let parsed = parse_proxies_stats(b"user@1.2.3.4:80\nuser@1.2.3.4:80\n", Scheme::Http);
+        assert!(parsed.entries.is_empty(), "got {:?}", parsed.entries);
+    }
+
+    #[test]
+    fn valid_bare_entry_survives_repeated_rejected_credentials() {
+        let parsed = parse_proxies_stats(
+            b"user@1.2.3.4:80\nuser@1.2.3.4:80\n1.2.3.4:80\n",
+            Scheme::Http,
+        );
+        assert_eq!(
+            parsed.entries,
+            vec![Entry {
+                addr: "1.2.3.4:80".parse().unwrap(),
+                scheme: Scheme::Http,
+                auth: None,
+            }],
+            "got {:?}",
+            parsed.entries,
+        );
+    }
+
+    #[test]
+    fn kept_scheme_prefix_suppresses_valid_bare_duplicate() {
+        assert_eq!(
+            parse_proxies(b"socks5://1.2.3.4:1080\n1.2.3.4:1080\n", Scheme::Http,),
+            vec![Entry {
+                addr: "1.2.3.4:1080".parse().unwrap(),
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
 
     #[test]
     fn prefixed_hostname_ports_enforce_valid_range() {
@@ -742,6 +850,163 @@ mod tests {
         assert!(strs.contains(&"10.0.0.2:8080".to_string()), "{strs:?}");
         assert!(!strs.contains(&"10.0.0.0:8080".to_string()));
         assert!(out.iter().all(|e| e.scheme == Scheme::Socks5));
+    }
+
+    #[test]
+    fn inline_comment_suffix_does_not_duplicate_bare_entry() {
+        assert_eq!(
+            parse_proxies(b"1.2.3.4:8080#US", Scheme::Socks5),
+            vec![Entry {
+                addr: "1.2.3.4:8080".parse().unwrap(),
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn surrounding_parentheses_do_not_duplicate_bare_entry() {
+        assert_eq!(
+            parse_proxies(b"(1.2.3.4:8080)", Scheme::Socks5),
+            vec![Entry {
+                addr: "1.2.3.4:8080".parse().unwrap(),
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn plus_suffix_does_not_duplicate_bare_entry() {
+        assert_eq!(
+            parse_proxies(b"1.2.3.4:80+80", Scheme::Socks5),
+            vec![Entry {
+                addr: "1.2.3.4:80".parse().unwrap(),
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn colon_quad_with_symbol_password_preserves_auth() {
+        assert_eq!(
+            parse_proxies(b"1.2.3.4:8080:user:p+ss", Scheme::Socks5),
+            vec![Entry {
+                addr: "1.2.3.4:8080".parse().unwrap(),
+                scheme: Scheme::Socks5,
+                auth: Some(Auth {
+                    user: "user".into(),
+                    password: Some("p+ss".into()),
+                }),
+            }],
+        );
+    }
+
+    #[test]
+    fn comma_separated_bare_entries_keep_distinct_addresses() {
+        assert_eq!(
+            parse_proxies(b"1.2.3.4:8080,5.6.7.8:80", Scheme::Socks5),
+            vec![
+                Entry {
+                    addr: "1.2.3.4:8080".parse().unwrap(),
+                    scheme: Scheme::Socks5,
+                    auth: None,
+                },
+                Entry {
+                    addr: "5.6.7.8:80".parse().unwrap(),
+                    scheme: Scheme::Socks5,
+                    auth: None,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn prefixed_and_bare_hostnames_are_deduplicated() {
+        assert_eq!(
+            parse_proxies_stats(
+                b"socks5://host.example:1080\nhost.example:1080\n",
+                Scheme::Socks5,
+            )
+            .hosts,
+            vec![HostEntry {
+                host: "host.example".into(),
+                port: 1080,
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn repeated_prefixed_hostname_is_deduplicated() {
+        assert_eq!(
+            parse_proxies_stats(
+                b"socks5://host.example:1080\nsocks5://host.example:1080\n",
+                Scheme::Http,
+            )
+            .hosts,
+            vec![HostEntry {
+                host: "host.example".into(),
+                port: 1080,
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn repeated_bare_hostname_is_deduplicated() {
+        assert_eq!(
+            parse_proxies_stats(b"host.example:1080\nhost.example:1080\n", Scheme::Socks5,).hosts,
+            vec![HostEntry {
+                host: "host.example".into(),
+                port: 1080,
+                scheme: Scheme::Socks5,
+                auth: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn prefixed_hostname_keeps_distinct_auth_identities() {
+        let parsed = parse_proxies_stats(
+            b"socks5://alice:first@host.example:1080\nsocks5://bob:second@host.example:1080\n",
+            Scheme::Http,
+        );
+        assert_eq!(parsed.hosts.len(), 2, "got {:?}", parsed.hosts);
+        let identities: Vec<Option<String>> = parsed
+            .hosts
+            .iter()
+            .map(|entry| entry.auth.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![Some("alice:first".into()), Some("bob:second".into())],
+            "got {:?}",
+            parsed.hosts,
+        );
+    }
+
+    #[test]
+    fn prefixed_hostname_auth_and_bare_hostname_are_distinct() {
+        let parsed = parse_proxies_stats(
+            b"socks5://alice:first@host.example:1080\nhost.example:1080\n",
+            Scheme::Http,
+        );
+        assert_eq!(parsed.hosts.len(), 2, "got {:?}", parsed.hosts);
+        let identities: Vec<Option<String>> = parsed
+            .hosts
+            .iter()
+            .map(|entry| entry.auth.as_ref().map(ToString::to_string))
+            .collect();
+        assert_eq!(
+            identities,
+            vec![Some("alice:first".into()), None],
+            "got {:?}",
+            parsed.hosts,
+        );
     }
 
     #[test]

@@ -685,17 +685,28 @@ async fn async_main(
                 partition_recent(candidates, &previous, now_secs(), cli.skip_recent);
         }
     }
-    if candidates.is_empty() {
-        // a fully-unparseable or empty input is a *measurement*, not a tool
-        // failure: exit 0 with the empty report (same contract as a run that
-        // checked N candidates and found 0 live)
-        qprintln!("[check ] 0 candidates \u{b7} nothing to check");
-    }
     let total = candidates.len();
     let parse_secs = t_parse.elapsed().as_secs_f64();
     let t_check = Instant::now();
+    // An all-reused incremental run has no probes to verify. A parse-empty run
+    // still constructs the Validator so primary-target health is measured.
     let (mut records, stats, per_target, labels, slot_caps, slot_errors) =
-        check_all(&cfg, candidates, &judge).await?;
+        if total == 0 && !reused.is_empty() {
+            qprintln!(
+                "[check ] 0 candidates to probe · reusing {} fresh",
+                reused.len()
+            );
+            (
+                Vec::new(),
+                Stats::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            check_all(&cfg, candidates, &judge).await?
+        };
     let check_secs = t_check.elapsed().as_secs_f64();
     if stats.received != total {
         return Err(format!(

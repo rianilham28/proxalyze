@@ -236,15 +236,16 @@ fn dead_port_has_dead_summary_and_no_jsonl_row() {
 #[test]
 fn comment_line_is_not_dialed() {
     let echo = EchoServer::start(EchoMode::Elite, 200);
-    let proxy = HttpProxyMock::open("127.0.0.1");
+    let commented_proxy = HttpProxyMock::open("127.0.0.1");
+    let live_proxy = HttpProxyMock::open("127.0.0.1");
     let dir = TestDir::new("comment_not_dialed");
     let input = dir.path().join("input.txt");
     std::fs::write(
         &input,
         format!(
             "# 127.0.0.1:{}\n127.0.0.1:{}\n",
-            proxy.addr.port(),
-            proxy.addr.port()
+            commented_proxy.addr.port(),
+            live_proxy.addr.port()
         ),
     )
     .unwrap();
@@ -256,7 +257,8 @@ fn comment_line_is_not_dialed() {
             .arg(format!("http://{}/ip", echo.addr)),
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(proxy.accepts(), 1);
+    assert_eq!(commented_proxy.accepts(), 0);
+    assert_eq!(live_proxy.accepts(), 1);
     assert!(stdout(&output).contains("1 kept"));
 }
 
@@ -345,11 +347,13 @@ fn closed_debug_stderr_pipe_still_writes_reports() {
     let mut stderr_pipe = child.stderr.take().unwrap();
     let mut startup = [0u8; 5];
     stderr_pipe.read_exact(&mut startup).unwrap();
-    // With a two-second total timeout, the parent must be descheduled for
-    // roughly 1.9s between this read and the adjacent drop for ordering to
-    // invert. That accepted residual can only make the test vacuous: the late
-    // guarded write would find an already-closed pipe either way, while a raw
-    // eprintln! panic would lose the result and trip the 2/2 integrity gate.
+    // The startup bytes are only a synchronization point after child stderr is
+    // live; the silent proxy's late debug failure is the EPIPE subject. With a
+    // two-second total timeout, the parent must be descheduled for roughly
+    // 1.9s between this read and the adjacent drop for ordering to invert. That
+    // accepted residual can only make the test vacuous: the late guarded write
+    // would find an already-closed pipe either way, while a raw eprintln! panic
+    // would lose the result and trip the 2/2 integrity gate.
     drop(stderr_pipe);
     let mut stdout_bytes = Vec::new();
     stdout_pipe.read_to_end(&mut stdout_bytes).unwrap();
@@ -485,12 +489,15 @@ fn query_string_survives_socks5_tunnel() {
         records(&dir.path().join("proxies.jsonl"))[0]["anonymity"],
         "elite"
     );
+    let targets = echo.targets();
+    // targets[0] is the direct startup shape-check; the SOCKS5 probe is only
+    // evidence when a distinct post-startup request retained the query.
+    assert!(targets.len() >= 2, "recorded targets: {targets:?}");
     assert!(
-        echo.targets()
+        targets[1..]
             .iter()
             .any(|target| target.ends_with("/ip?probe=1")),
-        "recorded targets: {:?}",
-        echo.targets()
+        "recorded targets: {targets:?}"
     );
 }
 

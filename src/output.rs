@@ -65,11 +65,14 @@ fn decode_record(line: &str) -> Result<LiveRecord, String> {
             _ => Err("unknown tag".into()),
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let anonymity = match value["anonymity"].as_str() {
-        Some("elite") => Some("elite"),
-        Some("anonymous") => Some("anonymous"),
-        Some("transparent") => Some("transparent"),
-        _ => None,
+    let anonymity = match value.get("anonymity") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_str() {
+            Some("elite") => Some("elite"),
+            Some("anonymous") => Some("anonymous"),
+            Some("transparent") => Some("transparent"),
+            _ => return Err("unknown anonymity".into()),
+        },
     };
     let optional_string = |name: &str| -> Result<Option<String>, String> {
         match value.get(name) {
@@ -414,6 +417,21 @@ mod tests {
         .unwrap();
         let (records, skipped) = read_records(&path).unwrap();
         assert_eq!(records.len(), 2);
+        assert_eq!(skipped, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_records_rejects_unknown_anonymity_but_accepts_null() {
+        assert_skipped(
+            &fixture_bytes(&[("anonymity", "\"banana\"")]),
+            "unknown-anonymity",
+        );
+        let path = std::env::temp_dir().join(format!("pxz-null-anonymity-{}", std::process::id()));
+        std::fs::write(&path, fixture_bytes(&[])).unwrap();
+        let (records, skipped) = read_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].anonymity, None);
         assert_eq!(skipped, 0);
         let _ = std::fs::remove_file(path);
     }
