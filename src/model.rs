@@ -57,6 +57,12 @@ impl fmt::Display for Auth {
     }
 }
 
+/// Stable Registry-compatible identity for persisted and candidate records.
+pub fn record_key(scheme: &str, addr: SocketAddr, auth: Option<&Auth>) -> String {
+    let credentials = auth.map(ToString::to_string).unwrap_or_default();
+    format!("{scheme}|{addr}|{credentials}")
+}
+
 /// One candidate proxy, tagged with the input file it was parsed from.
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -64,6 +70,8 @@ pub struct Candidate {
     pub scheme: Scheme,
     pub auth: Option<Auth>,
     pub input: String,
+    /// Index in the parse report; used for per-row incremental accounting.
+    pub input_row: Option<usize>,
 }
 
 impl Candidate {
@@ -73,7 +81,13 @@ impl Candidate {
             scheme,
             auth,
             input,
+            input_row: None,
         }
+    }
+
+    pub fn with_input_row(mut self, row: usize) -> Self {
+        self.input_row = Some(row);
+        self
     }
 }
 
@@ -84,6 +98,7 @@ pub struct ProbeResult {
     pub proxy: String,
     pub scheme: &'static str,
     pub input: String,
+    pub input_row: usize,
     /// live | auth-required | tls-fail | socks-rejected | tcp-alive | dead
     pub status: &'static str,
     /// elite | anonymous | transparent (live only)
@@ -139,13 +154,13 @@ pub struct Stats {
     /// windows into percentiles reads as "p50 connect 0ms" nonsense
     pub live_connect_ms: Vec<u32>,
     pub live_total_ms: Vec<u32>,
-    pub by_input: HashMap<String, (usize, usize, usize)>, // (live, auth, checked)
+    pub by_input: HashMap<usize, (usize, usize, usize)>, // (live, auth, checked)
 }
 
 impl Stats {
     pub fn record(&mut self, r: &ProbeResult) {
         self.received += 1;
-        let e = self.by_input.entry(r.input.clone()).or_insert((0, 0, 0));
+        let e = self.by_input.entry(r.input_row).or_insert((0, 0, 0));
         e.2 += 1;
         match r.status {
             "live" => e.0 += 1,
@@ -227,7 +242,29 @@ impl Default for Registry {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProbeResult, Stats};
+    use super::{Auth, ProbeResult, Stats, record_key};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn record_key_distinguishes_scheme_address_and_credentials() {
+        let addr: SocketAddr = "192.0.2.1:8080".parse().unwrap();
+        let auth = Auth {
+            user: "user".into(),
+            password: Some("secret".into()),
+        };
+        assert_eq!(
+            record_key("http", addr, None),
+            record_key("http", addr, None)
+        );
+        assert_ne!(
+            record_key("http", addr, None),
+            record_key("socks5", addr, None)
+        );
+        assert_ne!(
+            record_key("http", addr, None),
+            record_key("http", addr, Some(&auth))
+        );
+    }
 
     #[test]
     fn live_without_exit_ip_counts_unjudged_not_transparent() {
@@ -237,6 +274,7 @@ mod tests {
             scheme: "http",
             input: "f".into(),
             status: "live",
+            input_row: 0,
             anonymity: None,
             connect_ms: 1,
             ttfb_ms: Some(2),
@@ -267,5 +305,32 @@ mod tests {
             ),
             (1, 1, 2)
         );
+    }
+    #[test]
+    fn stats_separate_rows_sharing_an_input_label() {
+        let mut stats = Stats::default();
+        let first = ProbeResult {
+            proxy: "1.2.3.4:80".into(),
+            scheme: "http",
+            input: "shared".into(),
+            input_row: 0,
+            status: "live",
+            anonymity: None,
+            connect_ms: 1,
+            ttfb_ms: None,
+            total_ms: 1,
+            exit_ip: None,
+            slot: 0,
+            fail_reason: None,
+        };
+        let second = ProbeResult {
+            input_row: 1,
+            status: "dead",
+            ..first.clone()
+        };
+        stats.record(&first);
+        stats.record(&second);
+        assert_eq!(stats.by_input[&0], (1, 0, 1));
+        assert_eq!(stats.by_input[&1], (0, 0, 1));
     }
 }

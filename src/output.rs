@@ -12,8 +12,125 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 
+use serde_json::Value;
+
 use crate::config::Output;
 use crate::model::LiveRecord;
+
+/// Read persisted JSONL records, counting malformed or version-skew lines.
+pub fn read_records(path: &Path) -> Result<(Vec<LiveRecord>, usize), String> {
+    let body = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut records = Vec::new();
+    let mut skipped = 0;
+    for raw_line in body.split(|byte| *byte == b'\n') {
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            skipped += 1;
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        match decode_record(line) {
+            Ok(record) => records.push(record),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((records, skipped))
+}
+
+fn decode_record(line: &str) -> Result<LiveRecord, String> {
+    let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    let proxy = value["proxy"].as_str().ok_or("missing proxy")?.to_owned();
+    let type_ = match value["type"].as_str() {
+        Some("http") => "http",
+        Some("https") => "https",
+        Some("socks4") => "socks4",
+        Some("socks5") => "socks5",
+        _ => return Err("unknown proxy type".into()),
+    };
+    if proxy.split_once("://").map(|(scheme, _)| scheme) != Some(type_) {
+        return Err("proxy/type scheme mismatch".into());
+    }
+    let tags = value["tags"]
+        .as_array()
+        .ok_or_else(|| "missing tags".to_string())?
+        .iter()
+        .map(|tag| match tag.as_str() {
+            Some("hosting") => Ok("hosting"),
+            Some("cdn") => Ok("cdn"),
+            Some("mobile") => Ok("mobile"),
+            Some("vpn") => Ok("vpn"),
+            Some("residential-proxy") => Ok("residential-proxy"),
+            Some("auth-required") => Ok("auth-required"),
+            _ => Err("unknown tag".into()),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let anonymity = match value["anonymity"].as_str() {
+        Some("elite") => Some("elite"),
+        Some("anonymous") => Some("anonymous"),
+        Some("transparent") => Some("transparent"),
+        _ => None,
+    };
+    let optional_string = |name: &str| -> Result<Option<String>, String> {
+        match value.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(str::to_owned)
+                .map(Some)
+                .ok_or_else(|| format!("invalid {name}")),
+        }
+    };
+    let optional_u32 = |name: &str| -> Result<Option<u32>, String> {
+        match value.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| format!("invalid {name}"))?
+                .try_into()
+                .map(Some)
+                .map_err(|_| format!("{name} overflow")),
+        }
+    };
+    let exit_ip = match value.get("exit_ip") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or("invalid exit_ip")?
+                .parse()
+                .map_err(|_| "invalid exit_ip")?,
+        ),
+    };
+    Ok(LiveRecord {
+        proxy,
+        type_,
+        last_checked: value["last_checked"]
+            .as_u64()
+            .ok_or("missing last_checked")?,
+        speed_ms: value["speed_ms"]
+            .as_u64()
+            .ok_or("missing speed_ms")?
+            .try_into()
+            .map_err(|_| "speed_ms overflow")?,
+        connect_ms: value["connect_ms"]
+            .as_u64()
+            .ok_or("missing connect_ms")?
+            .try_into()
+            .map_err(|_| "connect_ms overflow")?,
+        ttfb_ms: optional_u32("ttfb_ms")?,
+        anonymity,
+        exit_ip,
+        asn: optional_u32("asn")?,
+        org: optional_string("org")?,
+        tags,
+        source: match value.get("source") {
+            None | Some(Value::Null) => "unknown".into(),
+            Some(v) => v.as_str().ok_or("invalid source")?.into(),
+        },
+        country: optional_string("country")?,
+    })
+}
 
 fn scheme_key(s: &str) -> u8 {
     match s {
@@ -158,6 +275,152 @@ mod tests {
             country: None,
             tags: vec![],
         }
+    }
+    #[test]
+    fn read_records_round_trips_every_field() {
+        let dir = std::env::temp_dir().join(format!("pxz-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = LiveRecord {
+            proxy: "socks4://user:p%40ss@192.0.2.1:1080".into(),
+            type_: "socks4",
+            last_checked: 1_700_000_123,
+            speed_ms: 41,
+            connect_ms: 17,
+            ttfb_ms: Some(29),
+            anonymity: Some("anonymous"),
+            exit_ip: Some("198.51.100.8".parse().unwrap()),
+            asn: Some(64512),
+            org: Some("Example Network".into()),
+            source: "pool.txt".into(),
+            country: Some("US".into()),
+            tags: vec!["vpn", "residential-proxy"],
+        };
+        write_out(
+            &dir,
+            &crate::config::Output::default(),
+            std::slice::from_ref(&record),
+        )
+        .unwrap();
+        let (back, skipped) = read_records(&dir.join("proxies.jsonl")).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].proxy, record.proxy);
+        assert_eq!(back[0].type_, record.type_);
+        assert_eq!(back[0].last_checked, record.last_checked);
+        assert_eq!(back[0].speed_ms, record.speed_ms);
+        assert_eq!(back[0].connect_ms, record.connect_ms);
+        assert_eq!(back[0].ttfb_ms, record.ttfb_ms);
+        assert_eq!(back[0].anonymity, record.anonymity);
+        assert_eq!(back[0].exit_ip, record.exit_ip);
+        assert_eq!(back[0].asn, record.asn);
+        assert_eq!(back[0].org, record.org);
+        assert_eq!(back[0].source, record.source);
+        assert_eq!(back[0].country, record.country);
+        assert_eq!(back[0].tags, record.tags);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_records_skips_unknown_tag_without_mangling_type() {
+        let dir = std::env::temp_dir().join(format!("pxz-unknown-tag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxies.jsonl");
+        std::fs::write(&path, br#"{"proxy":"socks4://192.0.2.1:1080","type":"socks4","last_checked":1,"speed_ms":1,"connect_ms":1,"ttfb_ms":null,"anonymity":null,"exit_ip":null,"tags":["quantum"],"source":"x"}"#).unwrap();
+        let (records, skipped) = read_records(&path).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(skipped, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_records_skips_truncated_final_line() {
+        let dir = std::env::temp_dir().join(format!("pxz-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proxies.jsonl");
+        let complete = serde_json::to_string(&rec("http", "192.0.2.2:8080")).unwrap();
+        let mut bytes = complete.into_bytes();
+        bytes.extend_from_slice(b"\n{\"proxy\":");
+        bytes.push(0xff);
+        std::fs::write(&path, bytes).unwrap();
+        let (records, skipped) = read_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].proxy, "http://192.0.2.2:8080");
+        assert_eq!(skipped, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn fixture_bytes(mutations: &[(&str, &str)]) -> Vec<u8> {
+        let base = br#"{"proxy":"http://192.0.2.20:8080","type":"http","last_checked":1,"speed_ms":1,"connect_ms":1,"ttfb_ms":1,"anonymity":null,"exit_ip":null,"asn":null,"org":null,"tags":[],"source":"x","country":null}"#;
+        let mut line = String::from_utf8(base.to_vec()).unwrap();
+        for (field, replacement) in mutations {
+            let start = line.find(&format!("\"{field}\":")).unwrap() + field.len() + 3;
+            let end = line[start..].find([',', '}']).unwrap() + start;
+            line.replace_range(start..end, replacement);
+        }
+        line.into_bytes()
+    }
+
+    fn assert_skipped(line: &[u8], name: &str) {
+        let path = std::env::temp_dir().join(format!("pxz-{name}-{}", std::process::id()));
+        std::fs::write(&path, line).unwrap();
+        let (records, skipped) = read_records(&path).unwrap();
+        assert!(records.is_empty(), "{name} record was reused");
+        assert_eq!(skipped, 1, "{name}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_records_rejects_non_utf8_in_complete_json() {
+        let mut line = fixture_bytes(&[("org", "\"badorg\"")]);
+        let position = line.windows(3).position(|window| window == b"bad").unwrap() + 3;
+        line.splice(position..position, [0xff]);
+        assert_skipped(&line, "strict-utf8");
+    }
+
+    #[test]
+    fn read_records_rejects_u32_overflow() {
+        for field in ["speed_ms", "connect_ms", "ttfb_ms", "asn"] {
+            assert_skipped(
+                &fixture_bytes(&[(field, "4294967296")]),
+                &format!("overflow-{field}"),
+            );
+        }
+    }
+
+    #[test]
+    fn read_records_rejects_present_invalid_optionals() {
+        for (field, value) in [
+            ("ttfb_ms", "\"nope\""),
+            ("exit_ip", "\"not-an-ip\""),
+            ("asn", "-1"),
+            ("org", "123"),
+            ("country", "123"),
+        ] {
+            assert_skipped(
+                &fixture_bytes(&[(field, value)]),
+                &format!("invalid-{field}"),
+            );
+        }
+    }
+
+    #[test]
+    fn read_records_accepts_absent_and_null_optionals() {
+        let path = std::env::temp_dir().join(format!("pxz-null-optionals-{}", std::process::id()));
+        let without = br#"{"proxy":"http://192.0.2.20:8080","type":"http","last_checked":1,"speed_ms":1,"connect_ms":1,"anonymity":null,"tags":[],"source":"x"}"#.to_vec();
+        std::fs::write(
+            &path,
+            [without, b"\n".to_vec(), fixture_bytes(&[])].concat(),
+        )
+        .unwrap();
+        let (records, skipped) = read_records(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(skipped, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_records_rejects_proxy_type_scheme_mismatch() {
+        assert_skipped(&fixture_bytes(&[("type", "\"socks4\"")]), "scheme-mismatch");
     }
 
     #[test]

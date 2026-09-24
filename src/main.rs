@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use config::{Config, InputFile, detect_asn_db, detect_city_db, split_input_spec};
 use geo::Judge;
 use model::{Candidate, ProbeResult, Registry, Stats};
-use output::{sort_records, write_out};
+use output::{read_records, sort_records, write_out};
 use parse::{HostEntry, parse_proxies_stats};
 use validate::{CheckCfg, Validator};
 
@@ -86,6 +86,10 @@ struct Cli {
     /// result)
     #[arg(long, default_value_t = 0)]
     min_live: usize,
+
+    /// Skip candidates whose previous proxies.jsonl record is younger than SECONDS (incremental re-check; 0 = off)
+    #[arg(long, default_value_t = 0)]
+    skip_recent: u64,
 }
 
 /// Resource governor: reserve ~20% of the machine's parallelism for
@@ -173,8 +177,11 @@ async fn load_candidates(
             let parsed = parse_proxies_stats(&body, scheme);
             let label = path.display().to_string();
             let mut kept = 0;
+            let row = per_file.len();
             for e in parsed.entries {
-                if registry.add(Candidate::new(e.addr, e.scheme, e.auth, label.clone())) {
+                if registry.add(
+                    Candidate::new(e.addr, e.scheme, e.auth, label.clone()).with_input_row(row),
+                ) {
                     kept += 1;
                 }
             }
@@ -182,6 +189,7 @@ async fn load_candidates(
             if resolve_hostnames {
                 let (resolved, unresolved, added) = resolve_host_entries(
                     &[(&parsed.hosts, label.as_str())],
+                    row,
                     &mut registry,
                     &mut dns_cache,
                     |host, port| {
@@ -206,6 +214,7 @@ async fn load_candidates(
 
 fn resolve_host_entries<F>(
     groups: &[(&[HostEntry], &str)],
+    input_row: usize,
     registry: &mut Registry,
     cache: &mut HashMap<(String, u16), Vec<IpAddr>>,
     mut resolver: F,
@@ -238,12 +247,10 @@ where
             resolved += 1;
             for ip in ips {
                 let addr = std::net::SocketAddr::new(*ip, host.port);
-                if registry.add(Candidate::new(
-                    addr,
-                    host.scheme,
-                    host.auth.clone(),
-                    (*label).to_string(),
-                )) {
+                if registry.add(
+                    Candidate::new(addr, host.scheme, host.auth.clone(), (*label).to_string())
+                        .with_input_row(input_row),
+                ) {
                     added += 1;
                 }
             }
@@ -378,9 +385,77 @@ async fn check_all(
         });
     }
     runner.await?;
+
     let slot_caps = v.slot_caps();
     let slot_errors = v.slot_errors();
     Ok((records, stats, per_target, labels, slot_caps, slot_errors))
+}
+fn is_fresh(now: u64, last_checked: u64, max_age: u64) -> bool {
+    now.saturating_sub(last_checked) <= max_age
+}
+
+fn persisted_record_key(record: &model::LiveRecord) -> Option<String> {
+    let (scheme, tail) = record.proxy.split_once("://")?;
+    let (credentials, address) = tail
+        .rsplit_once('@')
+        .map_or((None, tail), |(a, b)| (Some(a), b));
+    let auth = credentials.and_then(|raw| {
+        let (user, password) = match raw.split_once(':') {
+            Some((user, password)) => (user, Some(password)),
+            None => (raw, None),
+        };
+        (!user.is_empty()).then(|| model::Auth {
+            user: user.to_owned(),
+            password: password.map(str::to_owned),
+        })
+    });
+    Some(model::record_key(
+        scheme,
+        address.parse().ok()?,
+        auth.as_ref(),
+    ))
+}
+
+type ReusedByInput = HashMap<usize, usize>;
+
+fn partition_recent(
+    candidates: Vec<Candidate>,
+    previous: &[model::LiveRecord],
+    now: u64,
+    max_age: u64,
+) -> (Vec<Candidate>, Vec<model::LiveRecord>, ReusedByInput) {
+    let mut fresh: HashMap<String, &model::LiveRecord> = HashMap::new();
+    for record in previous {
+        if is_fresh(now, record.last_checked, max_age)
+            && let Some(key) = persisted_record_key(record)
+        {
+            fresh.insert(key, record);
+        }
+    }
+    let mut reused = Vec::new();
+    let mut reused_by_input: ReusedByInput = HashMap::new();
+    let mut candidates = candidates;
+    candidates.retain_mut(|candidate| {
+        let key = model::record_key(
+            candidate.scheme.as_str(),
+            candidate.addr,
+            candidate.auth.as_ref(),
+        );
+        if let Some(record) = fresh.remove(&key) {
+            if let Some(row) = candidate.input_row {
+                *reused_by_input.entry(row).or_default() += 1;
+            }
+            reused.push(record.clone());
+            false
+        } else {
+            true
+        }
+    });
+    (candidates, reused, reused_by_input)
+}
+
+fn input_checked(kept: usize, reused: usize) -> usize {
+    kept.saturating_sub(reused)
 }
 
 /// 1,487 -> "1,487"
@@ -404,7 +479,15 @@ type SummaryData<'a> = (
     &'a [u64],
 );
 
-fn summary(stats: &Stats, data: &SummaryData<'_>, records: usize, total: usize, cfg: &Config) {
+fn summary(
+    stats: &Stats,
+    data: &SummaryData<'_>,
+    records: usize,
+    total: usize,
+    reused: usize,
+    reused_by_input: &ReusedByInput,
+    cfg: &Config,
+) {
     qprintln!("summary");
     qprintln!(
         "  verdict   live {} (elite {} · anonymous {} · transparent {} · unjudged {}) · auth {} · tls-fail {} · socks-rejected {} · tcp-alive {} · dead {}",
@@ -459,19 +542,29 @@ fn summary(stats: &Stats, data: &SummaryData<'_>, records: usize, total: usize, 
     }
     qprintln!("  inputs");
     let mut any = false;
-    for (path, kept, malformed, hosts) in per_file {
-        let (live, auth, checked) = stats.by_input.get(path).copied().unwrap_or((0, 0, *kept));
+    for (index, (path, kept, malformed, hosts)) in per_file.iter().enumerate() {
+        let measured = stats.by_input.get(&index).copied();
+        let reused_for_input = reused_by_input.get(&index).copied().unwrap_or(0);
+        let checked = input_checked(*kept, reused_for_input);
+        // Live/auth remain label-keyed Stats aggregates; this preserves the
+        // pre-existing summary behavior when one label declares two schemes.
+        let (live, auth) = measured.map_or((0, 0), |(live, auth, _)| (live, auth));
         if *kept == 0 && *hosts == 0 && *malformed == 0 {
             continue;
         }
         any = true;
         let host_note = if *hosts > 0 {
-            format!(" \u{b7} {hosts} hostname lines")
+            format!(" · {hosts} hostname lines")
+        } else {
+            String::new()
+        };
+        let reuse_note = if reused_for_input > 0 {
+            format!(" · reused {reused_for_input}")
         } else {
             String::new()
         };
         qprintln!(
-            "            {path:<36} checked {:>7} \u{b7} live {:>5} ({:.1}%) \u{b7} auth-only {:>6}{host_note}",
+            "            {path:<36} checked {:>7} · live {:>5} ({:.1}%) · auth-only {:>6}{host_note}{reuse_note}",
             fmt_n(checked),
             fmt_n(live),
             100.0_f64 * live as f64 / checked.max(1) as f64,
@@ -482,7 +575,7 @@ fn summary(stats: &Stats, data: &SummaryData<'_>, records: usize, total: usize, 
         qprintln!("            (none)");
     }
     qprintln!(
-        "  integrity {}/{} results \u{2713} \u{b7} {} reportable \u{b7} {records} records \u{2713}",
+        "  integrity {}/{} results ✓ · {} reportable · {records} records ✓ · reused {reused} fresh · probed {total}",
         fmt_n(stats.received),
         fmt_n(total),
         fmt_n(stats.live_total() + stats.auth_required),
@@ -533,7 +626,7 @@ async fn async_main(
     let (registry, per_file, total_resolved, total_unresolved) =
         load_candidates(&cfg, cli.resolve_hostnames).await?;
     let dupes = registry.dupes;
-    let candidates = registry.into_candidates();
+    let mut candidates = registry.into_candidates();
     let total_mal: usize = per_file.iter().map(|(_, _, m, _)| m).sum();
     let total_hosts: usize = per_file.iter().map(|(_, _, _, h)| h).sum();
     for (path, kept, mal, hosts) in &per_file {
@@ -577,6 +670,21 @@ async fn async_main(
         t_parse.elapsed().as_secs_f64(),
         cfg.validate.check_url
     );
+    let mut reused = Vec::new();
+    let mut reused_by_input = HashMap::new();
+    if cli.skip_recent > 0 {
+        let path = std::path::Path::new(&cfg.output.dir).join("proxies.jsonl");
+        if !path.exists() {
+            qeprintln!("[skip ] no previous output · checking all");
+        } else {
+            let (previous, skipped) = read_records(&path)?;
+            if skipped > 0 {
+                qeprintln!("[skip ] {skipped} prior records unreadable · ignored");
+            }
+            (candidates, reused, reused_by_input) =
+                partition_recent(candidates, &previous, now_secs(), cli.skip_recent);
+        }
+    }
     if candidates.is_empty() {
         // a fully-unparseable or empty input is a *measurement*, not a tool
         // failure: exit 0 with the empty report (same contract as a run that
@@ -604,8 +712,9 @@ async fn async_main(
         )
         .into());
     }
+    records.extend(reused.iter().cloned());
     let t_write = Instant::now();
-    let written = if total == 0 {
+    let written = if total == 0 && records.is_empty() {
         qprintln!("[write ] 0 candidates \u{b7} existing outputs left untouched");
         None
     } else {
@@ -639,13 +748,18 @@ async fn async_main(
         &(&per_file, &per_target, &labels, &slot_caps, &slot_errors),
         records.len(),
         total,
+        reused.len(),
+        &reused_by_input,
         &cfg,
     );
-    if cli.min_live > 0 && stats.live_total() < cli.min_live {
-        // J: + reused_live
+    let reused_live = reused
+        .iter()
+        .filter(|record| !record.tags.contains(&"auth-required"))
+        .count();
+    if cli.min_live > 0 && stats.live_total() + reused_live < cli.min_live {
         qeprintln!(
             "min-live: {} live < required {}",
-            fmt_n(stats.live_total()),
+            fmt_n(stats.live_total() + reused_live),
             fmt_n(cli.min_live)
         );
         std::process::exit(3);
@@ -734,7 +848,7 @@ mod tests {
         let calls = Cell::new(0);
 
         let result =
-            resolve_host_entries(&[(&hosts, "test")], &mut registry, &mut cache, |_, _| {
+            resolve_host_entries(&[(&hosts, "test")], 0, &mut registry, &mut cache, |_, _| {
                 calls.set(calls.get() + 1);
                 Err(std::io::Error::other("lookup failed"))
             });
@@ -752,7 +866,7 @@ mod tests {
         let calls = Cell::new(0);
 
         let result =
-            resolve_host_entries(&[(&hosts, "test")], &mut registry, &mut cache, |_, _| {
+            resolve_host_entries(&[(&hosts, "test")], 0, &mut registry, &mut cache, |_, _| {
                 calls.set(calls.get() + 1);
                 Ok(vec![])
             });
@@ -780,6 +894,7 @@ mod tests {
 
         let result = resolve_host_entries(
             &[(&first, "first"), (&second, "second")],
+            0,
             &mut registry,
             &mut cache,
             |_, _| {
@@ -802,6 +917,7 @@ mod tests {
 
         let result = resolve_host_entries(
             &[(&first, "first"), (&second, "second")],
+            0,
             &mut registry,
             &mut cache,
             |_, _| {
@@ -812,5 +928,163 @@ mod tests {
 
         assert_eq!(calls.get(), 2);
         assert_eq!((result.0, result.1, result.2), (2, 0, 2));
+    }
+    #[test]
+    fn future_record_is_fresh() {
+        assert!(is_fresh(100, 10_100, 3_600));
+    }
+
+    #[test]
+    fn skip_recent_partitions_matching_fresh_records() {
+        let now = 1_700_000_100;
+        let cases = [
+            ("http://192.0.2.1:8080", None),
+            (
+                "http://user:pass@192.0.2.3:8080",
+                Some(model::Auth {
+                    user: "user".into(),
+                    password: Some("pass".into()),
+                }),
+            ),
+            (
+                "http://user:@192.0.2.4:8080",
+                Some(model::Auth {
+                    user: "user".into(),
+                    password: Some("".into()),
+                }),
+            ),
+            (
+                "http://user@192.0.2.2:8080",
+                Some(model::Auth {
+                    user: "user".into(),
+                    password: None,
+                }),
+            ),
+        ];
+        let mut candidates = Vec::new();
+        let mut records = Vec::new();
+        for (proxy, auth) in cases {
+            let tail = proxy.split_once("://").unwrap().1;
+            let address = tail.rsplit_once('@').map_or(tail, |(_, a)| a);
+            candidates.push(
+                Candidate::new(
+                    address.parse().unwrap(),
+                    Scheme::Http,
+                    auth.clone(),
+                    "pool.txt".into(),
+                )
+                .with_input_row(0),
+            );
+            let label = auth
+                .as_ref()
+                .map(ToString::to_string)
+                .map(|a| format!("{a}@"))
+                .unwrap_or_default();
+            records.push(model::LiveRecord {
+                proxy: format!("http://{label}{address}"),
+                type_: "http",
+                last_checked: now,
+                speed_ms: 10,
+                connect_ms: 4,
+                ttfb_ms: Some(6),
+                anonymity: Some("elite"),
+                exit_ip: Some(address.rsplit_once(':').unwrap().0.parse().unwrap()),
+                asn: None,
+                org: None,
+                tags: vec![],
+                source: "pool.txt".into(),
+                country: None,
+            });
+        }
+        candidates.push(
+            Candidate::new(
+                "192.0.2.9:8080".parse().unwrap(),
+                Scheme::Http,
+                None,
+                "pool.txt".into(),
+            )
+            .with_input_row(0),
+        );
+        let (probed, reused, reused_by_input) = partition_recent(candidates, &records, now, 3_600);
+        assert_eq!(probed.len(), 1);
+        assert_eq!(probed[0].addr, "192.0.2.9:8080".parse().unwrap());
+        assert_eq!(reused.len(), 4);
+        assert_eq!(reused_by_input.get(&0), Some(&4));
+    }
+
+    #[test]
+    fn persisted_empty_user_matches_bare_candidate_key() {
+        let bare = model::record_key("http", "192.0.2.10:8080".parse().unwrap(), None);
+        let mut record = model::LiveRecord {
+            proxy: "http://192.0.2.10:8080".into(),
+            type_: "http",
+            last_checked: 0,
+            speed_ms: 1,
+            connect_ms: 1,
+            ttfb_ms: None,
+            anonymity: None,
+            exit_ip: None,
+            asn: None,
+            org: None,
+            tags: vec![],
+            source: "pool.txt".into(),
+            country: None,
+        };
+        record.proxy = "http://:pass@192.0.2.10:8080".into();
+        assert_eq!(
+            persisted_record_key(&record).as_deref(),
+            Some(bare.as_str())
+        );
+    }
+
+    #[test]
+    fn input_checked_subtracts_row_specific_reuse() {
+        assert_eq!(input_checked(10, 10), 0);
+        assert_eq!(input_checked(10, 4), 6);
+        assert_eq!(input_checked(10, 0), 10);
+    }
+
+    #[test]
+    fn freshness_boundary_is_inclusive() {
+        assert!(is_fresh(10_000, 6_400, 3_600));
+        assert!(!is_fresh(10_000, 6_399, 3_600));
+    }
+
+    #[test]
+    fn inline_scheme_reuse_is_attributed_to_source_row() {
+        let now = 1_700_000_100;
+        let candidate = Candidate::new(
+            "192.0.2.42:1080".parse().unwrap(),
+            Scheme::Socks5,
+            None,
+            "inline.txt".into(),
+        )
+        .with_input_row(7);
+        let record = model::LiveRecord {
+            proxy: "socks5://192.0.2.42:1080".into(),
+            type_: "socks5",
+            last_checked: now,
+            speed_ms: 1,
+            connect_ms: 1,
+            ttfb_ms: None,
+            anonymity: None,
+            exit_ip: None,
+            asn: None,
+            org: None,
+            tags: vec![],
+            source: "inline.txt".into(),
+            country: None,
+        };
+        let (probed, reused, by_row) = partition_recent(vec![candidate], &[record], now, 3_600);
+        assert!(probed.is_empty());
+        assert_eq!(reused.len(), 1);
+        assert_eq!(by_row.get(&7), Some(&1));
+        assert_eq!(input_checked(1, by_row[&7]), 0);
+    }
+
+    #[test]
+    fn cli_parses_skip_recent() {
+        let cli = Cli::parse_from(["proxalyze", "--skip-recent", "42"]);
+        assert_eq!(cli.skip_recent, 42);
     }
 }

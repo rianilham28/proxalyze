@@ -288,6 +288,7 @@ impl Validator {
                     r.proxy = proxy_label(&c);
                 }
                 r.input = c.input;
+                r.input_row = c.input_row.unwrap_or(usize::MAX);
                 if let Some((_, reason)) = fail {
                     if me.cfg.debug {
                         qeprintln!("\n[{}] {} {reason}", r.status, r.proxy);
@@ -366,13 +367,14 @@ impl Validator {
                 }
             };
         let granted = Instant::now();
+        let plain_target = !slot.target.tls;
         let out = match (c.scheme, slot.target.tls) {
             (Scheme::Http, false) => self.forward_get(tcp, connected, c, slot).await,
             (Scheme::Https, false) => self.tls_proxy_get(tcp, connected, c, slot).await,
             (Scheme::Http, true) => self.connect_tls_get(tcp, connected, c, slot).await,
             (Scheme::Https, true) => self.tls_connect_tls_get(tcp, connected, c, slot).await,
-            (Scheme::Socks5, plain) => self.socks5_get(tcp, connected, plain, c, slot).await,
-            (Scheme::Socks4, plain) => self.socks4_get(tcp, connected, plain, c, slot).await,
+            (Scheme::Socks5, _) => self.socks5_get(tcp, connected, plain_target, c, slot).await,
+            (Scheme::Socks4, _) => self.socks4_get(tcp, connected, plain_target, c, slot).await,
         };
         drop(permit);
         match out {
@@ -415,6 +417,7 @@ impl Validator {
             proxy: String::new(),
             scheme: c.scheme.as_str(),
             input: String::new(),
+            input_row: c.input_row.unwrap_or(usize::MAX),
             status,
             anonymity: None,
             connect_ms: connected.duration_since(start).as_millis() as u32,
@@ -783,6 +786,7 @@ impl Validator {
             proxy: String::new(),
             scheme: "",
             input: String::new(),
+            input_row: usize::MAX,
             status: "dead",
             anonymity: None,
             connect_ms: 0,
