@@ -229,7 +229,28 @@ fn scan_bare(body: &[u8]) -> Vec<(SocketAddr, Option<Auth>)> {
     let mut out = Vec::new();
     let mut start = None;
     let keep = |b: u8| {
-        b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'/' | b'[' | b']' | b',' | b'-')
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'.' | b':'
+                    | b'/'
+                    | b'['
+                    | b']'
+                    | b','
+                    | b'-'
+                    | b'_'
+                    | b'+'
+                    | b'='
+                    | b'%'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'&'
+                    | b'*'
+                    | b'('
+                    | b')'
+                    | b'~'
+            )
     };
     for i in 0..=body.len() {
         if i < body.len() && keep(body[i]) {
@@ -585,6 +606,28 @@ mod tests {
             (a.user.as_str(), a.password.as_deref()),
             ("Admin", Some("Secret"))
         );
+    }
+    #[test]
+    fn bare_quad_passwords_preserve_symbols() {
+        let out = parse_proxies(b"1.2.3.4:8080:user:p+ss_w-rd!#1", Scheme::Http);
+        let a = out[0].auth.as_ref().unwrap();
+        assert_eq!(
+            (a.user.as_str(), a.password.as_deref()),
+            ("user", Some("p+ss_w-rd!#1"))
+        );
+    }
+
+    #[test]
+    fn bare_semicolon_separates_entries() {
+        let out = parse_proxies(b"1.2.3.4:8080:u:p;x 5.6.7.8:80", Scheme::Http);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].addr.to_string(), "1.2.3.4:8080");
+        assert_eq!(out[0].scheme, Scheme::Http);
+        let a = out[0].auth.as_ref().unwrap();
+        assert_eq!((a.user.as_str(), a.password.as_deref()), ("u", Some("p")));
+        assert_eq!(out[1].addr.to_string(), "5.6.7.8:80");
+        assert_eq!(out[1].scheme, Scheme::Http);
+        assert_eq!(out[1].auth, None);
     }
     #[test]
     fn mixed_plain_and_bare_auth_preserve_both_entries() {
