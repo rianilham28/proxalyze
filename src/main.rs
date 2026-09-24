@@ -46,17 +46,19 @@ struct Cli {
     /// {"origin": ...} / {"ip": ...}
     #[arg(long, default_value = "https://ipv4.icanhazip.com")]
     check_url: String,
-    /// Additional echo endpoints, round-robin with the primary; pass "" to
-    /// run with the primary alone (isolates echo problems)
+    /// Additional echo endpoints, round-robin with the primary; `""` alone
+    /// selects primary only; mixed with real URLs, empty entries are ignored
     #[arg(long = "backup-url")]
     backup_urls: Vec<String>,
 
     /// Proxies checked at once (fd limit is raised automatically). Measured
     /// safe to 2048 on residential links; beyond that carrier SYN-limits can
-    /// turn live proxies into false deads
+    /// turn live proxies into false deads (values below 16 are honored
+    /// exactly; the 16 floor applies only when -j >= 16)
     #[arg(short = 'j', long, default_value_t = 1024)]
     concurrency: usize,
-    /// Total seconds per check, never retried
+    /// Total seconds per check, never retried (must be finite, > 0, and
+    /// convert to a non-zero Duration)
     #[arg(long, default_value_t = 10.0)]
     timeout: f64,
     /// Seconds to connect; 2.0 is the measured sweet spot (retains every live
@@ -78,6 +80,12 @@ struct Cli {
     /// Resolve hostname:port candidates via DNS at load (one lookup per unique host)
     #[arg(long)]
     resolve_hostnames: bool,
+
+    /// Exit non-zero (code 3) when fewer than N live survivors are produced;
+    /// 0 disables the gate (CI pipelines that must not accept a silently-empty
+    /// result)
+    #[arg(long, default_value_t = 0)]
+    min_live: usize,
 }
 
 /// Resource governor: reserve ~20% of the machine's parallelism for
@@ -89,6 +97,14 @@ fn detect_workers() -> usize {
         .map(|n| n.get())
         .unwrap_or(4);
     (n * 4 / 5).max(2)
+}
+
+fn resolve_backup_urls(user: &[String]) -> Vec<String> {
+    if user.is_empty() {
+        config::Validate::default().backup_urls
+    } else {
+        user.iter().filter(|url| !url.is_empty()).cloned().collect()
+    }
 }
 
 fn build_config(cli: &Cli) -> Result<Config, String> {
@@ -109,13 +125,7 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
             })
             .collect()
     };
-    let backup_urls = if cli.backup_urls.iter().any(|b| b.trim().is_empty()) {
-        Vec::new()
-    } else if cli.backup_urls.is_empty() {
-        config::Validate::default().backup_urls
-    } else {
-        cli.backup_urls.clone()
-    };
+    let backup_urls = resolve_backup_urls(&cli.backup_urls);
     let cfg = Config {
         debug: cli.debug,
         inputs,
@@ -156,6 +166,10 @@ async fn load_candidates(
             } else {
                 std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?
             };
+            // The parser suppresses an auth-less bare re-sighting of any
+            // prefixed line as a substring artifact; exact identity is
+            // (addr, scheme, credentials), and cross-file exact duplicates
+            // are Registry's job.
             let parsed = parse_proxies_stats(&body, scheme);
             let label = path.display().to_string();
             let mut kept = 0;
@@ -272,6 +286,14 @@ macro_rules! qprintln {
     }};
 }
 
+/// Error-path stderr print that never panics on a closed pipe.
+macro_rules! qeprintln {
+    ($($a:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($a)*);
+    }};
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -288,6 +310,8 @@ async fn check_all(
         Stats,
         Vec<(u64, u64, u64)>,
         Vec<String>,
+        Vec<usize>,
+        Vec<u64>,
     ),
     Box<dyn Error>,
 > {
@@ -295,6 +319,9 @@ async fn check_all(
     let check_cfg = CheckCfg::from_validate(&cfg.validate, cfg.debug)?;
     let validator = std::sync::Arc::new(Validator::new(check_cfg, targets).await?);
     let labels = validator.active_targets();
+    // Clone before the Arc moves into spawn; read counters only after
+    // `runner.await`, since reading while validation is active yields zeros.
+    let v = validator.clone();
     let (tx, mut rx) = mpsc::channel::<ProbeResult>(4096);
     let runner = tokio::spawn(async move { validator.run(candidates, tx).await });
 
@@ -351,7 +378,9 @@ async fn check_all(
         });
     }
     runner.await?;
-    Ok((records, stats, per_target, labels))
+    let slot_caps = v.slot_caps();
+    let slot_errors = v.slot_errors();
+    Ok((records, stats, per_target, labels, slot_caps, slot_errors))
 }
 
 /// 1,487 -> "1,487"
@@ -367,15 +396,15 @@ fn fmt_n(n: impl std::fmt::Display) -> String {
     out
 }
 
-fn summary(
-    stats: &Stats,
-    per_file: &[(String, usize, usize, usize)],
-    per_target: &[(u64, u64, u64)],
-    labels: &[String],
-    records: usize,
-    total: usize,
-    cfg: &Config,
-) {
+type SummaryData<'a> = (
+    &'a [(String, usize, usize, usize)],
+    &'a [(u64, u64, u64)],
+    &'a [String],
+    &'a [usize],
+    &'a [u64],
+);
+
+fn summary(stats: &Stats, data: &SummaryData<'_>, records: usize, total: usize, cfg: &Config) {
     qprintln!("summary");
     qprintln!(
         "  verdict   live {} (elite {} · anonymous {} · transparent {} · unjudged {}) · auth {} · tls-fail {} · socks-rejected {} · tcp-alive {} · dead {}",
@@ -406,23 +435,25 @@ fn summary(
             cfg.validate.connect_timeout,
         );
     }
+    let (per_file, per_target, labels, slot_caps, slot_errors) = *data;
     if !labels.is_empty() {
-        qprintln!(
-            "  echoes    cap {} in-flight each",
-            cfg.validate
-                .max_concurrent_checks
-                .div_ceil(labels.len())
-                .max(16)
-        );
+        qprintln!("  echoes    cap per target");
         for (i, url) in labels.iter().enumerate() {
             let (live, tlsf, sat) = per_target.get(i).copied().unwrap_or((0, 0, 0));
+            let cap = slot_caps.get(i).copied().unwrap_or(0);
+            let target_errors = slot_errors.get(i).copied().unwrap_or(0);
+            let error_note = if target_errors > 0 {
+                "  <- echo returned 4xx/5xx mid-run; check --check-url or raise -j"
+            } else {
+                ""
+            };
+            let permit_note = if sat > 0 {
+                "  <- raise -j or add --backup-url"
+            } else {
+                ""
+            };
             qprintln!(
-                "            {url:<36} live {live:>5} \u{b7} tls-fail {tlsf:>5} \u{b7} permit-waits {sat}{}",
-                if sat > 0 {
-                    "  <- raise -j or add --backup-url"
-                } else {
-                    ""
-                }
+                "            {url:<36} cap {cap:>4} · live {live:>5} \u{b7} tls-fail {tlsf:>5} \u{b7} permit-waits {sat} \u{b7} target-err {target_errors}{error_note}{permit_note}"
             );
         }
     }
@@ -458,7 +489,14 @@ fn summary(
     );
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    if let Err(e) = run_main() {
+        qeprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run_main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let cfg = build_config(&cli)?;
     let (workers, source) = if cli.workers > 0 {
@@ -548,7 +586,8 @@ async fn async_main(
     let total = candidates.len();
     let parse_secs = t_parse.elapsed().as_secs_f64();
     let t_check = Instant::now();
-    let (mut records, stats, per_target, labels) = check_all(&cfg, candidates, &judge).await?;
+    let (mut records, stats, per_target, labels, slot_caps, slot_errors) =
+        check_all(&cfg, candidates, &judge).await?;
     let check_secs = t_check.elapsed().as_secs_f64();
     if stats.received != total {
         return Err(format!(
@@ -566,22 +605,29 @@ async fn async_main(
         .into());
     }
     let t_write = Instant::now();
-    sort_records(&mut records);
-    let dir = std::path::Path::new(&cfg.output.dir);
-    std::fs::create_dir_all(dir)?;
-    let written = write_out(dir, &cfg.output, &records)?;
-    let files: Vec<String> = written
-        .iter()
-        .map(|p| {
-            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            format!("{} ({} bytes)", p, fmt_n(size))
-        })
-        .collect();
-    qprintln!(
-        "[write ] {} in {:.2}s",
-        files.join(" \u{b7} "),
-        t_write.elapsed().as_secs_f64()
-    );
+    let written = if total == 0 {
+        qprintln!("[write ] 0 candidates \u{b7} existing outputs left untouched");
+        None
+    } else {
+        sort_records(&mut records);
+        let dir = std::path::Path::new(&cfg.output.dir);
+        std::fs::create_dir_all(dir)?;
+        Some(write_out(dir, &cfg.output, &records)?)
+    };
+    if let Some(written) = written {
+        let files: Vec<String> = written
+            .iter()
+            .map(|p| {
+                let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                format!("{} ({} bytes)", p, fmt_n(size))
+            })
+            .collect();
+        qprintln!(
+            "[write ] {} in {:.2}s",
+            files.join(" \u{b7} "),
+            t_write.elapsed().as_secs_f64()
+        );
+    }
     qprintln!(
         "[done  ] {:.1}s total (parse {:.2} \u{b7} check {check_secs:.1} \u{b7} write {:.2})",
         started.elapsed().as_secs_f64(),
@@ -590,13 +636,20 @@ async fn async_main(
     );
     summary(
         &stats,
-        &per_file,
-        &per_target,
-        &labels,
+        &(&per_file, &per_target, &labels, &slot_caps, &slot_errors),
         records.len(),
         total,
         &cfg,
     );
+    if cli.min_live > 0 && stats.live_total() < cli.min_live {
+        // J: + reused_live
+        qeprintln!(
+            "min-live: {} live < required {}",
+            fmt_n(stats.live_total()),
+            fmt_n(cli.min_live)
+        );
+        std::process::exit(3);
+    }
     Ok(())
 }
 
@@ -613,6 +666,100 @@ mod tests {
             scheme,
             auth,
         }
+    }
+
+    #[test]
+    fn backup_url_resolution_uses_defaults_when_no_backups_are_given() {
+        let resolved = resolve_backup_urls(&[]);
+
+        assert_eq!(
+            resolved,
+            vec![
+                "https://api.ipify.org".to_string(),
+                "https://checkip.amazonaws.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn backup_url_resolution_disables_backups_for_a_bare_empty_value() {
+        let resolved = resolve_backup_urls(&["".to_string()]);
+
+        assert_eq!(resolved, Vec::<String>::new());
+    }
+
+    #[test]
+    fn backup_url_resolution_drops_empty_entries_when_mixed_with_real_values() {
+        let resolved = resolve_backup_urls(&["https://a.example/x".to_string(), "".to_string()]);
+
+        assert_eq!(resolved, vec!["https://a.example/x"]);
+    }
+
+    #[test]
+    fn backup_url_resolution_preserves_two_real_values() {
+        let resolved = resolve_backup_urls(&[
+            "https://one.example".to_string(),
+            "https://two.example".to_string(),
+        ]);
+
+        assert_eq!(resolved, vec!["https://one.example", "https://two.example"]);
+    }
+
+    #[test]
+    fn cli_min_live_defaults_to_zero() {
+        let cli = Cli::parse_from(["proxalyze"]);
+
+        assert_eq!(cli.min_live, 0);
+    }
+
+    #[test]
+    fn cli_parses_min_live_override() {
+        let cli = Cli::parse_from(["proxalyze", "--min-live", "50"]);
+
+        assert_eq!(cli.min_live, 50);
+    }
+
+    #[test]
+    fn stdin_input_expands_to_exact_stdin_path() {
+        let inputs = expand_inputs("-").unwrap();
+
+        assert_eq!(inputs, vec![std::path::PathBuf::from("-")]);
+    }
+
+    #[test]
+    fn resolver_error_counts_one_unresolved_and_adds_no_candidate() {
+        let hosts = [host("proxy.example", 8080, Scheme::Http, None)];
+        let mut registry = Registry::new();
+        let mut cache = HashMap::new();
+        let calls = Cell::new(0);
+
+        let result =
+            resolve_host_entries(&[(&hosts, "test")], &mut registry, &mut cache, |_, _| {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::other("lookup failed"))
+            });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!((result.0, result.1, result.2), (0, 1, 0));
+        assert!(registry.into_candidates().is_empty());
+    }
+
+    #[test]
+    fn resolver_empty_success_counts_one_unresolved_and_adds_no_candidate() {
+        let hosts = [host("proxy.example", 8080, Scheme::Http, None)];
+        let mut registry = Registry::new();
+        let mut cache = HashMap::new();
+        let calls = Cell::new(0);
+
+        let result =
+            resolve_host_entries(&[(&hosts, "test")], &mut registry, &mut cache, |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(vec![])
+            });
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!((result.0, result.1, result.2), (0, 1, 0));
+        assert!(registry.into_candidates().is_empty());
     }
 
     #[test]

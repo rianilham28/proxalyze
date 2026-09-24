@@ -208,12 +208,10 @@ impl Validator {
         self.slots.iter().map(|s| s.target.url.clone()).collect()
     }
 
-    #[allow(dead_code)] // summary wiring lands in a later batch
     pub fn slot_caps(&self) -> Vec<usize> {
         self.slots.iter().map(|slot| slot.cap).collect()
     }
 
-    #[allow(dead_code)] // summary wiring lands in a later batch
     pub fn slot_errors(&self) -> Vec<u64> {
         self.slots
             .iter()

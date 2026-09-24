@@ -91,7 +91,8 @@ impl Default for Validate {
                 "https://api.ipify.org".into(),
                 "https://checkip.amazonaws.com".into(),
             ],
-            max_concurrent_checks: 512,
+            // must match the clap default_value_t in main.rs
+            max_concurrent_checks: 1024,
             timeout: 10.0,
             connect_timeout: 2.0,
         }
@@ -218,7 +219,7 @@ mod tests {
     fn defaults_are_the_shipped_sweet_spot() {
         let v = Validate::default();
         assert_eq!(v.connect_timeout, 2.0);
-        assert_eq!(v.max_concurrent_checks, 512);
+        assert_eq!(v.max_concurrent_checks, 1024);
         assert_eq!(v.backup_urls.len(), 2);
     }
 
