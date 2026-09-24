@@ -1,12 +1,12 @@
 //! proxalyze — validate proxy lists into clean, judged proxies. Configuration
-//! is command-line arguments only; the optional ASN judgment database is
-//! auto-detected (geo/GeoLite2-ASN.mmdb), never flagged.
+//! is command-line arguments only; optional ASN and City databases are
+//! auto-detected (geo/GeoLite2-ASN.mmdb and geo/GeoLite2-City.mmdb).
 //!
 //! Reads plain proxy files (each with a DECLARED protocol — nothing is
 //! guessed), checks every proxy on a raw hyper connection against an echo
 //! URL whose body reveals the exit IP, and writes raw data: proxy lists
-//! plus one JSONL record per survivor with every fact learned (timings,
-//! anonymity, exit IP, ASN, org, network-class tags). Run with --help.
+//! plus one JSONL record per survivor with source, timings, anonymity, exit
+//! IP, ASN, org, network-class tags, and optional country. Run with --help.
 
 mod config;
 mod geo;
@@ -23,7 +23,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use tokio::sync::mpsc;
 
-use config::{Config, InputFile, detect_asn_db, split_input_spec};
+use config::{Config, InputFile, detect_asn_db, detect_city_db, split_input_spec};
 use geo::Judge;
 use model::{Candidate, ProbeResult, Registry, Stats};
 use output::{sort_records, write_out};
@@ -127,6 +127,7 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
             connect_timeout: cli.connect_timeout,
         },
         asn_db: detect_asn_db(),
+        city_db: detect_city_db(),
         output: config::Output {
             dir: cli.out.clone(),
         },
@@ -344,6 +345,8 @@ async fn check_all(
             exit_ip: r.exit_ip,
             asn,
             org,
+            source: r.input.clone(),
+            country: r.exit_ip.and_then(|ip| judge.country(ip)),
             tags,
         });
     }
@@ -375,11 +378,12 @@ fn summary(
 ) {
     qprintln!("summary");
     qprintln!(
-        "  verdict   live {} (elite {} \u{b7} anonymous {} \u{b7} transparent {}) \u{b7} auth {} \u{b7} tls-fail {} \u{b7} socks-rejected {} \u{b7} tcp-alive {} \u{b7} dead {}",
+        "  verdict   live {} (elite {} · anonymous {} · transparent {} · unjudged {}) · auth {} · tls-fail {} · socks-rejected {} · tcp-alive {} · dead {}",
         fmt_n(stats.live_total()),
         fmt_n(stats.live_elite),
         fmt_n(stats.live_anonymous),
         fmt_n(stats.live_transparent),
+        fmt_n(stats.live_unjudged),
         fmt_n(stats.auth_required),
         fmt_n(stats.tls_fail),
         fmt_n(stats.socks_rejected),
@@ -476,14 +480,16 @@ async fn async_main(
     cli: &Cli,
 ) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
-    let judge = Judge::open(cfg.asn_db.as_deref())?;
+    let judge = Judge::open(cfg.asn_db.as_deref(), cfg.city_db.as_deref())?;
+    let geo_state = match (cfg.asn_db.as_deref(), cfg.city_db.as_deref()) {
+        (Some(_), Some(_)) => "geo asn+city".to_string(),
+        (Some(path), None) => format!("geo asn {path}"),
+        (None, Some(path)) => format!("geo city {path}"),
+        (None, None) => "geo off".to_string(),
+    };
     qprintln!(
-        "proxalyze {} \u{b7} workers {workers} ({wsrc}){}",
+        "proxalyze {} · workers {workers} ({wsrc}) · {geo_state}",
         env!("CARGO_PKG_VERSION"),
-        match &cfg.asn_db {
-            Some(p) => format!(" \u{b7} geo {p}"),
-            None => " \u{b7} geo off".into(),
-        }
     );
     let t_parse = Instant::now();
     let (registry, per_file, total_resolved, total_unresolved) =

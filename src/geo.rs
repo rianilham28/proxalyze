@@ -1,11 +1,10 @@
-//! Proxy judgment from offline MaxMind GeoLite2 databases.
+//! Proxy judgment and raw location facts from offline MaxMind GeoLite2 databases.
 //!
-//! The operator provides the .mmdb files (paths in [geo]); proxalyze opens
-//! them at startup and fails loudly if a configured file is missing or
-//! corrupt. The ASN database classifies the exit network (hosting / cdn /
-//! mobile / vpn / residential-proxy). Location is not part of the judgment.
-//! These facts, together with anonymity class and latency, are the judgment
-//! of *how useful* a working proxy is — emitted raw, without derived grades.
+//! The operator provides the .mmdb files (paths detected at startup); a
+//! configured file that fails to open is a loud error. The ASN database
+//! classifies the exit network (hosting / cdn / mobile / vpn /
+//! residential-proxy). The City database emits the exit country as a raw
+//! fact, never as part of the judgment, tags, or rank.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -14,6 +13,7 @@ use serde_json::Value;
 
 pub struct Judge {
     asn: Option<maxminddb::Reader<Vec<u8>>>,
+    city: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 #[derive(Default, Clone)]
@@ -25,18 +25,26 @@ pub struct Network {
 }
 
 impl Judge {
-    /// `path` = auto-detected ASN database path, if any. A configured file
-    /// that fails to open is an error (loud), absence is not.
-    pub fn open(path: Option<&str>) -> Result<Self, String> {
-        let asn = match path {
-            Some(p) => Some(open_db(p, "ASN database")?),
+    pub fn open(asn_path: Option<&str>, city_path: Option<&str>) -> Result<Self, String> {
+        let asn = match asn_path {
+            Some(path) => Some(open_db(path, "ASN database")?),
             None => None,
         };
-        Ok(Self { asn })
+        let city = match city_path {
+            Some(path) => Some(open_db(path, "City database")?),
+            None => None,
+        };
+        Ok(Self { asn, city })
     }
 
     pub fn active(&self) -> bool {
         self.asn.is_some()
+    }
+
+    pub fn country(&self, ip: IpAddr) -> Option<String> {
+        let db = self.city.as_ref()?;
+        let value = db.lookup(ip).ok()?.decode::<Value>().ok()??;
+        country_from_value(&value)
     }
 
     pub fn locate(&self, ip: IpAddr) -> Network {
@@ -75,6 +83,14 @@ impl Judge {
         }
         net
     }
+}
+
+fn country_from_value(value: &Value) -> Option<String> {
+    value
+        .get("country")
+        .and_then(|country| country.get("iso_code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Datacenter/CDN providers that dominate public proxy pools. Used only as a
@@ -174,5 +190,24 @@ mod tests {
         assert_eq!(infer_class(398704, "STACKS INC"), vec!["hosting"]);
         // A real residential ISP stays untagged.
         assert!(infer_class(7713, "Telekom Indonesia").is_empty());
+    }
+
+    #[test]
+    fn country_reads_top_level_maxmind_country() {
+        let value = serde_json::json!({"country": {"iso_code": "US"}});
+        assert_eq!(country_from_value(&value).as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn country_is_none_when_top_level_country_is_absent() {
+        let city_only = serde_json::json!({"city": {"names": {"en": "Paris"}}});
+        assert_eq!(country_from_value(&city_only), None);
+        assert_eq!(country_from_value(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn no_geo_databases_leave_country_unavailable() {
+        let judge = Judge::open(None, None).unwrap();
+        assert!(judge.country("1.2.3.4".parse().unwrap()).is_none());
     }
 }

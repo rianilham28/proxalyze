@@ -1,8 +1,8 @@
 //! Output stage: raw data, two files.
 //!
 //!   OUT/proxies.txt     scheme://[user:pass@]ip:port — every survivor
-//!   OUT/proxies.jsonl   one raw record per line: timings, anonymity, exit
-//!                       IP, ASN, org, network-class tags
+//!   OUT/proxies.jsonl   one raw record per line: source, timings, anonymity,
+//!                       exit IP, ASN, org, network-class tags, optional country
 //!
 //! Order is deterministic (protocol, IP, port) so runs diff cleanly. Both
 //! files are rewritten every run.
@@ -154,6 +154,8 @@ mod tests {
             exit_ip: None,
             asn: None,
             org: None,
+            source: "examples/sample.txt".into(),
+            country: None,
             tags: vec![],
         }
     }
@@ -258,6 +260,11 @@ mod tests {
                 anonymity: intern_anon(r["anonymity"].as_str()),
                 exit_ip: None,
                 asn: None,
+                source: r["source"]
+                    .as_str()
+                    .expect("checked-in row missing mandatory source")
+                    .to_string(),
+                country: None,
                 org: None,
                 tags: r["tags"]
                     .as_array()
@@ -295,11 +302,14 @@ mod tests {
                 "asn",
                 "org",
                 "tags",
+                "source",
+                "country",
             ]
             .iter()
             .map(|s| s.to_string())
             .collect();
             assert!(keys.is_subset(&expected), "unexpected key in {r}");
+            assert!(keys.contains("source"), "row missing mandatory source: {r}");
             assert!(expected.iter().any(|k| keys.contains(k)));
             let proxy = r["proxy"].as_str().unwrap();
             let host = proxy

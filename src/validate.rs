@@ -24,10 +24,10 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Empty};
 use rustls::pki_types::ServerName;
 use serde_json::Value;
@@ -38,6 +38,16 @@ use tokio::task::JoinSet;
 
 use crate::config::{CheckTarget, Validate};
 use crate::model::{Auth, Candidate, ProbeResult, Scheme};
+
+const MAX_BODY: usize = 64 * 1024;
+
+/// stderr write that never panics when the display pipe is closed.
+macro_rules! qeprintln {
+    ($($a:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), $($a)*);
+    }};
+}
 
 #[derive(Clone)]
 pub struct CheckCfg {
@@ -58,7 +68,7 @@ impl CheckCfg {
             Err(_) => want.min(256),
         };
         Ok(Self {
-            concurrency: want.min(cap).max(16),
+            concurrency: want.min(cap).max(1),
             connect_timeout: Duration::from_secs_f64(v.connect_timeout),
             total_timeout: Duration::from_secs_f64(v.timeout),
             debug,
@@ -72,7 +82,9 @@ pub struct TargetSlot {
     /// resolved addresses, IPv4 first (SOCKS4 needs a v4 literal)
     pub ips: Vec<IpAddr>,
     pub authority: String,
+    pub cap: usize,
     sem: Arc<Semaphore>,
+    errors: Arc<AtomicU64>,
 }
 
 /// (bucket, human detail). Buckets are the stable vocabulary; detail shows
@@ -109,60 +121,52 @@ impl Validator {
         if targets.is_empty() {
             return Err("no check targets configured".into());
         }
-        let targets_len = targets.len();
         let tls_verify_off = Arc::new(tls_config(false)?);
         let tls_verified = Arc::new(tls_config(true)?);
-        let mut slots = Vec::new();
-        for (i, t) in targets.into_iter().enumerate() {
-            match resolve(&t).await {
-                Ok(ips) => {
-                    let authority = authority_of(&t);
-                    slots.push(TargetSlot {
-                        sem: Arc::new(Semaphore::new(
-                            cfg.concurrency.div_ceil(targets_len).max(16),
-                        )),
-                        target: t,
-                        ips,
-                        authority,
-                    });
-                }
-                Err(e) if i == 0 => return Err(e),
-                Err(e) => eprintln!("[validate] backup target {} dropped: {e}", t.url),
-            }
-        }
         let mut me = Self {
             cfg,
-            slots,
+            slots: Vec::new(),
             rr: AtomicUsize::new(0),
             own_egress: None,
             tls_verify_off,
             tls_verified,
             done: Arc::new(AtomicUsize::new(0)),
         };
+
+        // Resolve every target first, preserving primary-fatal and
+        // backup-drop behavior. Shape checks do not need slot permits.
+        let mut resolved = Vec::new();
+        for (i, target) in targets.into_iter().enumerate() {
+            match resolve(&target).await {
+                Ok(ips) => resolved.push((target, ips)),
+                Err(e) if i == 0 => return Err(e),
+                Err(e) => qeprintln!("[validate] backup target {} dropped: {e}", target.url),
+            }
+        }
+
         // Health-check each echo's BODY SHAPE at startup: an echo that
         // answers but whose body we cannot read as an IP would silently
         // null out exit_ip/anonymity for every proxy assigned to it — a
         // wrong verdict, so drop it loudly instead.
-        let mut i = 0usize;
-        while i < me.slots.len() {
-            let shape = me.check_shape(&me.slots[i]).await;
-            let url = me.slots[i].target.url.clone();
+        let mut healthy = Vec::new();
+        for (i, (target, ips)) in resolved.into_iter().enumerate() {
+            let url = target.url.clone();
+            let shape = me.check_shape(&target, &ips, &authority_of(&target)).await;
             match shape {
                 Shape::Ok(ip) => {
                     if i == 0 {
                         me.own_egress = Some(ip);
                     }
-                    i += 1;
+                    healthy.push((target, ips));
                 }
                 Shape::Unreachable if i == 0 => {
-                    eprintln!(
+                    qeprintln!(
                         "[validate] primary {url} unreachable now; transparent-detection degraded, liveness still runs"
                     );
-                    i += 1;
+                    healthy.push((target, ips));
                 }
                 Shape::Unreachable => {
-                    eprintln!("[validate] backup {url} unreachable at startup, dropped");
-                    me.slots.remove(i);
+                    qeprintln!("[validate] backup {url} unreachable at startup, dropped");
                 }
                 Shape::Wrong(detail) if i == 0 => {
                     return Err(format!(
@@ -170,10 +174,31 @@ impl Validator {
                     ));
                 }
                 Shape::Wrong(detail) => {
-                    eprintln!("[validate] backup {url} wrong body shape ({detail}), dropped");
-                    me.slots.remove(i);
+                    qeprintln!("[validate] backup {url} wrong body shape ({detail}), dropped");
                 }
             }
+        }
+
+        // Allocate permits only after startup drops, so -j 4 stays -j 4.
+        let slot_cap = slot_cap(me.cfg.concurrency, healthy.len());
+        me.slots = healthy
+            .into_iter()
+            .map(|(target, ips)| {
+                let authority = authority_of(&target);
+                TargetSlot {
+                    target,
+                    ips,
+                    authority,
+                    cap: slot_cap,
+                    sem: Arc::new(Semaphore::new(slot_cap)),
+                    errors: Arc::new(AtomicU64::new(0)),
+                }
+            })
+            .collect();
+        if me.slots.first().is_some_and(|slot| !slot.target.tls) {
+            qeprintln!(
+                "[validate] WARNING: --check-url is http:// — a lying proxy can forge the exit-IP body; https targets are certificate-verified"
+            );
         }
         Ok(me)
     }
@@ -183,10 +208,25 @@ impl Validator {
         self.slots.iter().map(|s| s.target.url.clone()).collect()
     }
 
+    #[allow(dead_code)] // summary wiring lands in a later batch
+    pub fn slot_caps(&self) -> Vec<usize> {
+        self.slots.iter().map(|slot| slot.cap).collect()
+    }
+
+    #[allow(dead_code)] // summary wiring lands in a later batch
+    pub fn slot_errors(&self) -> Vec<u64> {
+        self.slots
+            .iter()
+            .map(|slot| slot.errors.load(Ordering::Relaxed))
+            .collect()
+    }
+
     pub async fn run(self: &Arc<Self>, candidates: Vec<Candidate>, tx: mpsc::Sender<ProbeResult>) {
         let total = candidates.len();
         let done = self.done.clone();
         let progress = tokio::spawn(async move {
+            use std::io::IsTerminal;
+            let tty = std::io::stderr().is_terminal();
             let t0 = Instant::now();
             let mut last = usize::MAX;
             loop {
@@ -208,6 +248,9 @@ impl Validator {
                     "eta   ---".into()
                 }; // first batches all land at the connect-timeout mark:
                 // eta computed off them thrashes 2600s->700s and reads broken
+                if !tty {
+                    continue;
+                }
                 if !progress(&format!(
                     "\r[check ] {d:>7}/{total:<7} {:>3}%  {rate:>5.0}/s  {eta_s} ",
                     d * 100 / total
@@ -215,11 +258,20 @@ impl Validator {
                     break; // display gone; finish the run silently
                 }
             }
-            progress(&format!(
-                "\r[check ] {total:>7}/{total:<7} 100%  {:>5.1}/s  done in {:>5.1}s\n",
-                total as f64 / t0.elapsed().as_secs_f64().max(0.001),
-                t0.elapsed().as_secs_f64()
-            ));
+            let final_line = if tty {
+                format!(
+                    "\r[check ] {total:>7}/{total:<7} 100%  {:>5.1}/s  done in {:>5.1}s",
+                    total as f64 / t0.elapsed().as_secs_f64().max(0.001),
+                    t0.elapsed().as_secs_f64()
+                )
+            } else {
+                format!(
+                    "[check ] {total:>7}/{total:<7} 100%  {:>5.1}/s  done in {:>5.1}s",
+                    total as f64 / t0.elapsed().as_secs_f64().max(0.001),
+                    t0.elapsed().as_secs_f64()
+                )
+            };
+            progress(&format!("{final_line}\n"));
         });
         let mut set = JoinSet::new();
         for c in candidates {
@@ -240,7 +292,7 @@ impl Validator {
                 r.input = c.input;
                 if let Some((_, reason)) = fail {
                     if me.cfg.debug {
-                        eprintln!("\n[{}] {} {reason}", r.status, r.proxy);
+                        qeprintln!("\n[{}] {} {reason}", r.status, r.proxy);
                     }
                     r.fail_reason = Some(reason);
                 }
@@ -315,6 +367,7 @@ impl Validator {
                     );
                 }
             };
+        let granted = Instant::now();
         let out = match (c.scheme, slot.target.tls) {
             (Scheme::Http, false) => self.forward_get(tcp, connected, c, slot).await,
             (Scheme::Https, false) => self.tls_proxy_get(tcp, connected, c, slot).await,
@@ -330,12 +383,23 @@ impl Validator {
                 r.scheme = c.scheme.as_str();
                 r.slot = slot_idx as i16;
                 r.connect_ms = connected.duration_since(start).as_millis() as u32;
-                r.total_ms = start.elapsed().as_millis() as u32;
+                // speed_ms = dial + request; echo-permit queue wait is not proxy slowness
+                r.total_ms = r
+                    .connect_ms
+                    .saturating_add(granted.elapsed().as_millis() as u32);
                 (r, None)
             }
             Err(fail) => {
                 let mut r = self.blank(c, fail.0, start, connected, slot_idx as i16);
                 r.proxy = proxy_label(c);
+                if fail.1.starts_with("target status") {
+                    slot.errors.fetch_add(1, Ordering::Relaxed);
+                }
+                r.connect_ms = connected.duration_since(start).as_millis() as u32;
+                // speed_ms = dial + request; echo-permit queue wait is not proxy slowness
+                r.total_ms = r
+                    .connect_ms
+                    .saturating_add(granted.elapsed().as_millis() as u32);
                 (r, Some(fail))
             }
         }
@@ -514,15 +578,7 @@ impl Validator {
         })
         .await
         .map_err(|_| ("socks-rejected", "socks4 timeout".to_string()))??;
-        // VN must be 0: GRANT 90 / REJECT 91 / IDENTD 92 / CHAIN 93.
-        if reply[0] != 0 {
-            return Err(("socks-rejected", format!("socks4 reply VN={}", reply[0])));
-        }
-        match reply[1] {
-            90 => {}
-            92 => return Err(("auth-required", "socks4 identd refusal".into())),
-            code => return Err(("socks-rejected", format!("socks4 reply code {code}"))),
-        }
+        interpret_socks4_reply(reply)?;
         self.tunneled_get(tcp, connected, plain_target, c.addr.ip(), slot)
             .await
     }
@@ -575,6 +631,7 @@ impl Validator {
         }
         b = b
             .header(http::header::ACCEPT, "*/*")
+            .header(http::header::USER_AGENT, user_agent())
             .header(http::header::CONNECTION, "close");
         if let Some(a) = auth {
             let pass = a.password.clone().unwrap_or_default();
@@ -700,15 +757,22 @@ impl Validator {
                 .map_err(|e| ("tcp-alive", e.to_string()))?;
             let ttfb_ms = t0.elapsed().as_millis() as u32;
             let status = resp.status().as_u16();
-            let body =
-                tokio::time::timeout(Duration::from_millis(1500), resp.into_body().collect())
-                    .await
-                    .map_err(|_| ("tcp-alive", "body timeout".to_string()))?
-                    .map_err(|e| ("tcp-alive", e.to_string()))?
-                    .to_bytes();
-            if body.len() > 64 * 1024 {
-                return Err(("tcp-alive", "oversized response".into()));
-            }
+            let body = tokio::time::timeout(Duration::from_millis(1500), async {
+                let mut body = resp.into_body();
+                let mut buf = BytesMut::new();
+                while let Some(item) = body.frame().await {
+                    let frame = item.map_err(|e| ("tcp-alive", e.to_string()))?;
+                    if let Ok(data) = frame.into_data() {
+                        if buf.len() + data.len() > MAX_BODY {
+                            return Err::<_, Fail>(("tcp-alive", "oversized response".into()));
+                        }
+                        buf.extend_from_slice(&data);
+                    }
+                }
+                Ok::<_, Fail>(buf.freeze())
+            })
+            .await
+            .map_err(|_| ("tcp-alive", "body timeout".into()))??;
             Ok::<_, Fail>((status, body, ttfb_ms))
         })
         .await;
@@ -760,14 +824,14 @@ impl Validator {
     /// Direct (no-proxy) fetch of a slot, validating BOTH reachability and
     /// body shape; the primary's parsed IP is our own egress (what makes
     /// `transparent` detectable).
-    async fn check_shape(&self, slot: &TargetSlot) -> Shape {
-        let Some(&ip) = slot.ips.first() else {
+    async fn check_shape(&self, target: &CheckTarget, ips: &[IpAddr], authority: &str) -> Shape {
+        let Some(&ip) = ips.first() else {
             return Shape::Unreachable;
         };
         let start = Instant::now();
         let tcp = match tokio::time::timeout(
             self.cfg.connect_timeout,
-            TcpStream::connect((ip, slot.target.port)),
+            TcpStream::connect((ip, target.port)),
         )
         .await
         {
@@ -775,20 +839,21 @@ impl Validator {
             _ => return Shape::Unreachable,
         };
         let _ = tcp.set_nodelay(true);
-        let req = match self.request(&slot.target.path, Some(&slot.authority), None) {
+        let req = match self.request(&target.path, Some(authority), None) {
             Ok(r) => r,
             Err(_) => return Shape::Unreachable,
         };
-        let outcome = if slot.target.tls {
+        let budget = self.remaining(start);
+        let outcome = if target.tls {
             match self
-                .tls_wrap(&self.tls_verified, tcp, start, &slot.target.host)
+                .tls_wrap(&self.tls_verified, tcp, start, &target.host)
                 .await
             {
-                Ok(t) => self.read_once(t, req).await,
+                Ok(t) => self.read_once(t, req, budget).await,
                 Err(_) => return Shape::Unreachable,
             }
         } else {
-            self.read_once(tcp, req).await
+            self.read_once(tcp, req, budget).await
         };
         let (_status, body) = match outcome {
             Ok(v) => v,
@@ -814,6 +879,7 @@ impl Validator {
         &self,
         io: I,
         req: http::Request<Empty<Bytes>>,
+        budget: Duration,
     ) -> Result<(u16, Bytes), Fail>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -825,20 +891,29 @@ impl Validator {
         let driver = tokio::spawn(async move {
             let _ = conn.await;
         });
-        let resp = sender
-            .send_request(req)
-            .await
-            .map_err(|e| ("tcp-alive", e.to_string()))?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| ("tcp-alive", e.to_string()))?
-            .to_bytes();
+        let outcome = tokio::time::timeout(budget, async {
+            let resp = sender
+                .send_request(req)
+                .await
+                .map_err(|e| ("tcp-alive", e.to_string()))?;
+            let status = resp.status().as_u16();
+            let mut body = resp.into_body();
+            let mut buf = BytesMut::new();
+            while let Some(item) = body.frame().await {
+                let frame = item.map_err(|e| ("tcp-alive", e.to_string()))?;
+                if let Ok(data) = frame.into_data() {
+                    if buf.len() + data.len() > MAX_BODY {
+                        return Err::<_, Fail>(("tcp-alive", "oversized response".into()));
+                    }
+                    buf.extend_from_slice(&data);
+                }
+            }
+            Ok((status, buf.freeze()))
+        })
+        .await;
         drop(sender);
         driver.abort();
-        Ok((status, body))
+        outcome.map_err(|_| ("tcp-alive", "shape-check timeout".into()))?
     }
 }
 
@@ -860,6 +935,29 @@ fn authority_of(t: &CheckTarget) -> String {
         t.host.clone()
     } else {
         format!("{}:{}", t.host, t.port)
+    }
+}
+
+fn user_agent() -> &'static str {
+    concat!("proxalyze/", env!("CARGO_PKG_VERSION"))
+}
+
+fn slot_cap(concurrency: usize, slots: usize) -> usize {
+    let floor = if concurrency >= 16 { 16 } else { 1 };
+    concurrency
+        .div_ceil(slots.max(1))
+        .max(floor)
+        .min(concurrency)
+}
+
+fn interpret_socks4_reply(reply: [u8; 8]) -> Result<(), Fail> {
+    if reply[0] != 0 {
+        return Err(("socks-rejected", format!("socks4 reply VN={}", reply[0])));
+    }
+    match reply[1] {
+        90 => Ok(()),
+        92 => Err(("auth-required", "socks4 identd refusal".into())),
+        code => Err(("socks-rejected", format!("socks4 reply code {code}"))),
     }
 }
 
@@ -1078,6 +1176,34 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn validator() -> Validator {
+        Validator {
+            cfg: CheckCfg {
+                concurrency: 1,
+                connect_timeout: Duration::from_secs(1),
+                total_timeout: Duration::from_secs(1),
+                debug: false,
+            },
+            slots: Vec::new(),
+            rr: AtomicUsize::new(0),
+            own_egress: None,
+            tls_verify_off: Arc::new(tls_config(false).unwrap()),
+            tls_verified: Arc::new(tls_config(true).unwrap()),
+            done: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn respond_to_connect(mut client: tokio::io::DuplexStream, response: &'static [u8]) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 128];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let n = client.read(&mut chunk).await.unwrap();
+            assert_ne!(n, 0, "validator closed CONNECT before sending its request");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        client.write_all(response).await.unwrap();
+    }
+
     #[test]
     fn classify_uses_proxy_ip() {
         let own = ip("1.1.1.1");
@@ -1121,6 +1247,8 @@ mod tests {
                 ips,
                 authority: host.into(),
                 sem: Arc::new(Semaphore::new(1)),
+                cap: 1,
+                errors: Arc::new(AtomicU64::new(0)),
             }
         }
         let v4 = IpAddr::from([1, 2, 3, 4]);
@@ -1153,6 +1281,74 @@ mod tests {
         assert_eq!(authority_of(&t), "h.example");
         let t2 = CheckTarget { port: 8443, ..t };
         assert_eq!(authority_of(&t2), "h.example:8443");
+    }
+
+    #[test]
+    fn user_agent_is_present() {
+        assert_eq!(
+            user_agent(),
+            concat!("proxalyze/", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn slot_cap_respects_low_concurrency() {
+        assert_eq!(slot_cap(4, 3), 2);
+        assert_eq!(slot_cap(1024, 3), 342);
+        assert_eq!(slot_cap(1024, 1), 1024);
+        assert_eq!(slot_cap(4, 1), 4);
+    }
+
+    #[tokio::test]
+    async fn connect_phase_accepts_successful_connect_reply() {
+        let (mut client, peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(respond_to_connect(peer, b"HTTP/1.1 200 OK\r\n\r\n"));
+
+        let result = validator()
+            .connect_phase(&mut client, Instant::now(), "example.com:443", None)
+            .await;
+
+        server.await.unwrap();
+        assert!(result.is_ok(), "HTTP 200 CONNECT reply should succeed");
+    }
+
+    #[tokio::test]
+    async fn connect_phase_maps_407_to_auth_required() {
+        let (mut client, peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(respond_to_connect(peer, b"HTTP/1.1 407 Proxy Auth\r\n\r\n"));
+
+        let result = validator()
+            .connect_phase(&mut client, Instant::now(), "example.com:443", None)
+            .await;
+
+        server.await.unwrap();
+        assert_eq!(
+            result.expect_err("HTTP 407 CONNECT reply should fail").0,
+            "auth-required"
+        );
+    }
+
+    #[test]
+    fn interpret_socks4_reply_maps_reply_codes() {
+        assert!(interpret_socks4_reply([0, 90, 0, 0, 0, 0, 0, 0]).is_ok());
+        assert_eq!(
+            interpret_socks4_reply([0, 91, 0, 0, 0, 0, 0, 0])
+                .expect_err("SOCKS4 request rejected")
+                .0,
+            "socks-rejected"
+        );
+        assert_eq!(
+            interpret_socks4_reply([0, 92, 0, 0, 0, 0, 0, 0])
+                .expect_err("SOCKS4 identd required")
+                .0,
+            "auth-required"
+        );
+        assert_eq!(
+            interpret_socks4_reply([4, 90, 0, 0, 0, 0, 0, 0])
+                .expect_err("SOCKS4 reply with bad version must fail")
+                .0,
+            "socks-rejected"
+        );
     }
 
     #[test]

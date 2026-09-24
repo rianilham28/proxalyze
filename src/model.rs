@@ -117,6 +117,9 @@ pub struct LiveRecord {
     pub org: Option<String>,
     /// hosting | cdn | mobile | vpn | residential-proxy | auth-required
     pub tags: Vec<&'static str>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
 }
 
 /// Aggregated check stats printed at the end of a run.
@@ -126,6 +129,7 @@ pub struct Stats {
     pub live_elite: usize,
     pub live_anonymous: usize,
     pub live_transparent: usize,
+    pub live_unjudged: usize,
     pub auth_required: usize,
     pub tls_fail: usize,
     pub socks_rejected: usize,
@@ -155,7 +159,8 @@ impl Stats {
         match (r.status, r.anonymity) {
             ("live", Some("elite")) => self.live_elite += 1,
             ("live", Some("anonymous")) => self.live_anonymous += 1,
-            ("live", _) => self.live_transparent += 1,
+            ("live", Some("transparent")) => self.live_transparent += 1,
+            ("live", _) => self.live_unjudged += 1,
             ("auth-required", _) => self.auth_required += 1,
             ("tls-fail", _) => self.tls_fail += 1,
             ("socks-rejected", _) => self.socks_rejected += 1,
@@ -165,7 +170,7 @@ impl Stats {
     }
 
     pub fn live_total(&self) -> usize {
-        self.live_elite + self.live_anonymous + self.live_transparent
+        self.live_elite + self.live_anonymous + self.live_transparent + self.live_unjudged
     }
 
     pub fn percentile(sorted: &[u32], p: f64) -> u32 {
@@ -217,5 +222,50 @@ impl Registry {
 impl Default for Registry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProbeResult, Stats};
+
+    #[test]
+    fn live_without_exit_ip_counts_unjudged_not_transparent() {
+        let mut stats = Stats::default();
+        let mut result = ProbeResult {
+            proxy: "1.2.3.4:80".into(),
+            scheme: "http",
+            input: "f".into(),
+            status: "live",
+            anonymity: None,
+            connect_ms: 1,
+            ttfb_ms: Some(2),
+            total_ms: 3,
+            exit_ip: None,
+            slot: 0,
+            fail_reason: None,
+        };
+
+        stats.record(&result);
+        assert_eq!(
+            (
+                stats.live_unjudged,
+                stats.live_transparent,
+                stats.live_total()
+            ),
+            (1, 0, 1)
+        );
+
+        result.anonymity = Some("transparent");
+        result.exit_ip = "9.9.9.9".parse().ok();
+        stats.record(&result);
+        assert_eq!(
+            (
+                stats.live_transparent,
+                stats.live_unjudged,
+                stats.live_total()
+            ),
+            (1, 1, 2)
+        );
     }
 }

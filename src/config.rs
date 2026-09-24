@@ -14,6 +14,7 @@ pub struct Config {
     pub validate: Validate,
     pub asn_db: Option<String>,
     pub output: Output,
+    pub city_db: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,24 @@ pub fn detect_asn_db() -> Option<String> {
     [
         "geo/GeoLite2-ASN.mmdb",
         "~/.local/share/proxalyze/GeoLite2-ASN.mmdb",
+    ]
+    .iter()
+    .filter_map(|p| {
+        let expanded = match p.strip_prefix("~") {
+            Some(rest) => format!("{}{}", std::env::var("HOME").ok()?, rest),
+            None => (*p).to_string(),
+        };
+        std::path::Path::new(&expanded).exists().then_some(expanded)
+    })
+    .next()
+}
+
+/// GeoLite2-City database for raw exit-country facts. Auto-detected beside
+/// the ASN database; absence only omits the country field.
+pub fn detect_city_db() -> Option<String> {
+    [
+        "geo/GeoLite2-City.mmdb",
+        "~/.local/share/proxalyze/GeoLite2-City.mmdb",
     ]
     .iter()
     .filter_map(|p| {
@@ -201,6 +220,11 @@ mod tests {
         assert_eq!(v.connect_timeout, 2.0);
         assert_eq!(v.max_concurrent_checks, 512);
         assert_eq!(v.backup_urls.len(), 2);
+    }
+
+    #[test]
+    fn city_db_detection_returns_an_option() {
+        let _: Option<String> = detect_city_db();
     }
 
     #[test]
