@@ -135,7 +135,7 @@ availability, timings, and rates vary by machine and network, so the captured
 numbers below are not promises:
 
 ```text
-proxalyze 0.1.0 · workers 11 (auto 80%) · geo asn+city
+proxalyze 1.0.0 · workers 11 (auto 80%) · geo asn+city
 [parse ] examples/sample.txt                         3 kept
 [parse ] 1 files · 3 unique candidates (0 dupes) in 0.0s · check https://ipv4.icanhazip.com
 [check ]       3/3       100%    1.4/s  done in   2.1s
