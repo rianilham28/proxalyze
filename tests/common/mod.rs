@@ -16,6 +16,14 @@ pub enum EchoMode {
     Transparent,
 }
 
+/// Explicitly make an accepted stream blocking. BSD/macOS inherit O_NONBLOCK
+/// from the nonblocking listener (Linux does not), which defeats the
+/// handlers' blocking reads with SO_RCVTIMEO: they fail instantly with
+/// WouldBlock instead of waiting for the peer's next segment.
+fn make_blocking(stream: &TcpStream) {
+    stream.set_nonblocking(false).unwrap();
+}
+
 impl EchoMode {
     fn body(self) -> &'static str {
         match self {
@@ -56,6 +64,7 @@ impl EchoServer {
                         let request_number = thread_request_number.clone();
                         let _ = thread::spawn(move || {
                             let mut stream = stream;
+                            make_blocking(&stream);
                             stream
                                 .set_read_timeout(Some(Duration::from_secs(1)))
                                 .unwrap();
@@ -202,6 +211,7 @@ fn handle_http_proxy(
     body: &str,
     status: u16,
 ) {
+    make_blocking(&stream);
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
@@ -331,6 +341,7 @@ impl Drop for Socks5Mock {
 }
 
 fn handle_socks_client(mut stream: TcpStream, credentials: Option<&(String, String)>) {
+    make_blocking(&stream);
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
