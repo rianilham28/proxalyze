@@ -123,6 +123,17 @@ struct Cli {
     /// Append run stats + pool delta to <out>/history.jsonl
     #[arg(long)]
     history: bool,
+
+    /// Download a timed sample through each live proxy for a speed tier
+    /// (requires --throughput-url)
+    #[arg(long)]
+    probe_throughput: bool,
+    /// URL serving a sizable body for --probe-throughput sampling
+    #[arg(long, default_value = "")]
+    throughput_url: String,
+    /// Probe keep-alive and chunked-POST support on live proxies (adds tags)
+    #[arg(long)]
+    probe_capabilities: bool,
 }
 
 /// Resource governor: reserve ~20% of the machine's parallelism for
@@ -204,6 +215,9 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
             max_concurrent_checks: cli.concurrency,
             timeout: cli.timeout,
             connect_timeout: cli.connect_timeout,
+            throughput_url: cli.throughput_url.clone(),
+            probe_throughput: cli.probe_throughput,
+            probe_capabilities: cli.probe_capabilities,
         },
         asn_db: detect_asn_db(),
         city_db: detect_city_db(),

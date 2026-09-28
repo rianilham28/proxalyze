@@ -70,6 +70,14 @@ pub struct Validate {
     /// live dial (first-SYN-retransmit survivors land at 0.95-1.9 s) while
     /// cutting wall time ~35% vs 5.0; 1.0 clips live proxies.
     pub connect_timeout: f64,
+    /// Sized body downloaded through each live proxy to measure kbps.
+    /// Empty (the default) disables the throughput probe entirely.
+    pub throughput_url: String,
+    /// Sample that URL for a speed tier. Default-off: no extra dials.
+    pub probe_throughput: bool,
+    /// Probe keep-alive / chunked-POST support on the live connection.
+    /// Default-off: no extra requests.
+    pub probe_capabilities: bool,
 }
 
 /// GeoLite2-ASN database for network-class judgment. Auto-detected at
@@ -133,6 +141,9 @@ impl Default for Validate {
             // must match the clap default_value_t in main.rs
             max_concurrent_checks: 1024,
             timeout: 10.0,
+            throughput_url: String::new(),
+            probe_throughput: false,
+            probe_capabilities: false,
             connect_timeout: 2.0,
         }
     }
@@ -183,6 +194,14 @@ impl Config {
                 "--connect-timeout ({}) must not exceed --timeout ({})",
                 self.validate.connect_timeout, self.validate.timeout
             ));
+        }
+
+        let tp_url = self.validate.throughput_url.trim();
+        if self.validate.probe_throughput && tp_url.is_empty() {
+            return Err("--probe-throughput requires --throughput-url URL".into());
+        }
+        if !tp_url.is_empty() {
+            parse_target(tp_url).map_err(|e| format!("--throughput-url {tp_url}: {e}"))?;
         }
 
         if let Some(floor) = &self.filters.min_anonymity {
@@ -443,6 +462,31 @@ mod tests {
         cfg.filters.countries = vec!["FRA".into()];
         assert!(cfg.check().unwrap_err().contains("--country"));
         cfg.filters.countries = vec!["fr".into(), "de".into()];
+        assert!(cfg.check().is_ok());
+    }
+
+    #[test]
+    fn probe_throughput_without_url_is_clean_error() {
+        let mut cfg = valid_http_config();
+        cfg.validate.probe_throughput = true;
+        let err = cfg.check().unwrap_err();
+        assert!(err.contains("--throughput-url"), "{err}");
+    }
+
+    #[test]
+    fn throughput_url_with_bad_scheme_rejected_even_when_flag_off() {
+        let mut cfg = valid_http_config();
+        cfg.validate.throughput_url = "ftp://x".into();
+        let err = cfg.check().unwrap_err();
+        assert!(err.contains("--throughput-url"), "{err}");
+    }
+
+    #[test]
+    fn throughput_url_alone_needs_no_flag() {
+        let mut cfg = valid_http_config();
+        cfg.validate.throughput_url = "https://example.org/big.bin".into();
+        assert!(cfg.check().is_ok());
+        cfg.validate.probe_throughput = true;
         assert!(cfg.check().is_ok());
     }
 }

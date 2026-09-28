@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::BodyExt;
 use rustls::pki_types::ServerName;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -41,6 +41,97 @@ use crate::model::{Auth, Candidate, ProbeResult, Scheme};
 
 const MAX_BODY: usize = 64 * 1024;
 const OVERSIZED_RESPONSE: &str = "oversized response";
+
+/// Throughput sample cap. Separate from MAX_BODY on purpose: the echo body
+/// is just an IP, while a speed sample wants as much as the budget allows.
+/// Reaching the cap is success, not an error.
+const THROUGHPUT_MAX: usize = 256 * 1024;
+
+/// Speed tier from a measured kbps figure. Boundaries are exact.
+pub fn speed_tier_of(kbps: u32) -> &'static str {
+    match kbps {
+        2048.. => "fast",
+        512.. => "mid",
+        _ => "slow",
+    }
+}
+
+/// The throughput sample target, resolved once (DNS is not a per-check cost).
+pub struct ResolvedTarget {
+    pub check: CheckTarget,
+    /// resolved addresses, IPv4 first (SOCKS4 needs a v4 literal)
+    pub ips: Vec<IpAddr>,
+    pub authority: String,
+}
+
+/// What a capability follow-up needs to replay the primary request on the
+/// same connection. Borrowed from the flow that opened it, so the follow-up
+/// cannot drift from the request it is measuring support for.
+pub struct ConnExtras<'a> {
+    /// exactly the URI the primary request used
+    pub target_url: &'a str,
+    pub origin_host: Option<&'a str>,
+    pub auth: Option<&'a Auth>,
+}
+
+/// The body of any request this lane sends. `Empty` has an exact zero
+/// length so a plain GET is byte-identical to today's `Empty<Bytes>` wire
+/// shape; `Chunked` deliberately has an unknown length, which is what makes
+/// hyper emit `Transfer-Encoding: chunked` on http1.
+enum ProbeBody {
+    Empty,
+    /// `None` once the single frame has been handed over: the second poll
+    /// must report end-of-stream, not an empty frame forever.
+    Chunked(Option<&'static [u8]>),
+}
+
+impl hyper::body::Body for ProbeBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            ProbeBody::Empty => std::task::Poll::Ready(None),
+            ProbeBody::Chunked(chunk) => match chunk.take() {
+                Some(bytes) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                    Bytes::from_static(bytes),
+                )))),
+                None => std::task::Poll::Ready(None),
+            },
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            ProbeBody::Empty => hyper::body::SizeHint::with_exact(0),
+            ProbeBody::Chunked(_) => hyper::body::SizeHint::default(),
+        }
+    }
+}
+
+/// A dialed proxy connection in whatever layering the scheme ended up with,
+/// erased to one type so the throughput pass can build all six shapes.
+type BoxedIo = Box<dyn Duplex>;
+
+/// The read/write surface a tunneled transport exposes; naming it lets every
+/// layering branch box into the same `BoxedIo`.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// Saturating whole-millisecond elapsed — the shape every ms field uses.
+fn ms_since(t0: Instant) -> u32 {
+    u32::try_from(t0.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
+/// One body type for the whole lane: the primary GET and both capability
+/// follow-ups then share a single `SendRequest`, i.e. one connection.
+type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
+
+/// Payload of the chunked-POST capability probe.
+const CHUNKED_POST_BODY: &[u8] = b"proxalyze-capability-probe";
 
 /// stderr write that never panics when the display pipe is closed.
 macro_rules! qeprintln {
@@ -56,6 +147,10 @@ pub struct CheckCfg {
     pub connect_timeout: Duration,
     pub total_timeout: Duration,
     pub debug: bool,
+    pub probe_capabilities: bool,
+    pub probe_throughput: bool,
+    /// Parsed sample target; `None` when no --throughput-url was given.
+    pub throughput: Option<CheckTarget>,
 }
 
 impl CheckCfg {
@@ -68,11 +163,19 @@ impl CheckCfg {
             Ok(granted) => granted.saturating_sub(64).max(16) as usize,
             Err(_) => want.min(256),
         };
+        let tp = v.throughput_url.trim();
         Ok(Self {
             concurrency: want.min(cap).max(1),
             connect_timeout: Duration::from_secs_f64(v.connect_timeout),
             total_timeout: Duration::from_secs_f64(v.timeout),
             debug,
+            probe_capabilities: v.probe_capabilities,
+            probe_throughput: v.probe_throughput,
+            throughput: if tp.is_empty() {
+                None
+            } else {
+                Some(crate::config::parse_target(tp)?)
+            },
         })
     }
 }
@@ -100,6 +203,7 @@ pub struct Validator {
     tls_verify_off: Arc<rustls::ClientConfig>,
     tls_verified: Arc<rustls::ClientConfig>,
     done: Arc<AtomicUsize>,
+    throughput: Option<ResolvedTarget>,
 }
 
 /// Progress redraw on stderr. Returns false once the sink is gone
@@ -124,6 +228,20 @@ impl Validator {
         }
         let tls_verify_off = Arc::new(tls_config(false)?);
         let tls_verified = Arc::new(tls_config(true)?);
+        // An explicitly requested throughput URL must resolve: a typo'd
+        // --throughput-url would otherwise silently zero every kbps.
+        let throughput = match cfg.throughput.clone() {
+            None => None,
+            Some(check) => {
+                let ips = resolve(&check).await?;
+                let authority = authority_of(&check);
+                Some(ResolvedTarget {
+                    check,
+                    ips,
+                    authority,
+                })
+            }
+        };
         let mut me = Self {
             cfg,
             slots: Vec::new(),
@@ -132,6 +250,7 @@ impl Validator {
             tls_verify_off,
             tls_verified,
             done: Arc::new(AtomicUsize::new(0)),
+            throughput,
         };
 
         // Resolve every target first, preserving primary-fatal and
@@ -377,17 +496,27 @@ impl Validator {
             (Scheme::Socks5, _) => self.socks5_get(tcp, connected, plain_target, c, slot).await,
             (Scheme::Socks4, _) => self.socks4_get(tcp, connected, plain_target, c, slot).await,
         };
-        drop(permit);
         match out {
             Ok(mut r) => {
                 r.proxy = proxy_label(c);
                 r.scheme = c.scheme.as_str();
                 r.slot = slot_idx as i16;
                 r.connect_ms = connected.duration_since(start).as_millis() as u32;
-                // speed_ms = dial + request; echo-permit queue wait is not proxy slowness
+                // speed_ms = dial + request; echo-permit queue wait is not
+                // proxy slowness, and capability follow-ups are decoration —
+                // subtracted so a flag-on pool sorts like a flag-off one.
                 r.total_ms = r
                     .connect_ms
-                    .saturating_add(granted.elapsed().as_millis() as u32);
+                    .saturating_add(ms_since(granted).saturating_sub(r.decor_ms));
+                // Throughput rides the SAME permit as the echo exchange
+                // (advisory: extra probes are charged against one slot
+                // budget) and only runs once the verdict is settled: a
+                // failed sample leaves a live proxy live, without a tier.
+                if r.status == "live" && self.cfg.probe_throughput && self.throughput.is_some() {
+                    r.kbps = self.throughput_probe(c).await;
+                    r.speed_tier = r.kbps.map(speed_tier_of);
+                }
+                drop(permit);
                 (r, None)
             }
             Err(fail) => {
@@ -401,6 +530,7 @@ impl Validator {
                 r.total_ms = r
                     .connect_ms
                     .saturating_add(granted.elapsed().as_millis() as u32);
+                drop(permit);
                 (r, Some(fail))
             }
         }
@@ -445,7 +575,9 @@ impl Validator {
         slot: &TargetSlot,
     ) -> Result<ProbeResult, Fail> {
         let req = self.request(&slot.target.url, None, c.auth.as_ref())?;
-        self.run_conn(tcp, req, connected, c.addr.ip()).await
+        let extras = self.extras(&slot.target.url, None, c.auth.as_ref());
+        self.run_conn(tcp, req, connected, c.addr.ip(), extras.as_ref())
+            .await
     }
 
     /// https proxy + http target: TLS to the proxy (self-signed endpoints
@@ -462,7 +594,8 @@ impl Validator {
             .tls_wrap(&self.tls_verify_off, tcp, connected, &slot.target.host)
             .await?;
         let req = self.request(&slot.target.url, None, c.auth.as_ref())?;
-        self.run_conn(tls, req, connected, c.addr.ip())
+        let extras = self.extras(&slot.target.url, None, c.auth.as_ref());
+        self.run_conn(tls, req, connected, c.addr.ip(), extras.as_ref())
             .await
             .map_err(bump_tls)
     }
@@ -482,7 +615,8 @@ impl Validator {
             .tls_wrap(&self.tls_verified, tcp, connected, &slot.target.host)
             .await?;
         let req = self.request(&slot.target.path, Some(&slot.authority), c.auth.as_ref())?;
-        self.run_conn(tls, req, connected, c.addr.ip())
+        let extras = self.extras(&slot.target.path, Some(&slot.authority), c.auth.as_ref());
+        self.run_conn(tls, req, connected, c.addr.ip(), extras.as_ref())
             .await
             .map_err(bump_tls)
     }
@@ -506,23 +640,24 @@ impl Validator {
             .tls_wrap(&self.tls_verified, outer, connected, &slot.target.host)
             .await?;
         let req = self.request(&slot.target.path, Some(&slot.authority), c.auth.as_ref())?;
-        self.run_conn(inner, req, connected, c.addr.ip())
+        let extras = self.extras(&slot.target.path, Some(&slot.authority), c.auth.as_ref());
+        self.run_conn(inner, req, connected, c.addr.ip(), extras.as_ref())
             .await
             .map_err(bump_tls)
     }
 
-    /// socks5: domain-form CONNECT (proxy-side DNS); username/password
-    /// sub-negotiation when the entry carried credentials; optional verified
-    /// TLS on top for https targets.
-    async fn socks5_get(
+    /// socks5 domain-form handshake only (proxy-side DNS; username/password
+    /// sub-negotiation when the entry carried credentials). Shared with the
+    /// throughput pass, which needs the same tunnel over a fresh dial.
+    async fn socks5_handshake(
         &self,
         tcp: TcpStream,
-        connected: Instant,
-        plain_target: bool,
         c: &Candidate,
-        slot: &TargetSlot,
-    ) -> Result<ProbeResult, Fail> {
-        let target = (slot.target.host.as_str(), slot.target.port);
+        host: &str,
+        port: u16,
+        connected: Instant,
+    ) -> Result<TcpStream, Fail> {
+        let target = (host, port);
         let handshake = async {
             match &c.auth {
                 Some(a) if !a.user.is_empty() => match &a.password {
@@ -546,33 +681,41 @@ impl Validator {
             .await
             .map_err(|_| ("dead", "socks5 timeout".to_string()))?
             .map_err(|e| (socks_error_status(&format!("{e:?}")), format!("{e:?}")))?;
-        let inner = tunnel.into_inner();
-        self.tunneled_get(inner, connected, plain_target, c.addr.ip(), slot)
-            .await
+        Ok(tunnel.into_inner())
     }
 
-    /// socks4: v4-literal handshake (no proxy-side DNS), optional TLS, GET.
-    async fn socks4_get(
+    /// socks5: handshake, then the shared post-tunnel shape.
+    async fn socks5_get(
         &self,
-        mut tcp: TcpStream,
+        tcp: TcpStream,
         connected: Instant,
         plain_target: bool,
         c: &Candidate,
         slot: &TargetSlot,
     ) -> Result<ProbeResult, Fail> {
-        let Some(&IpAddr::V4(ip)) = slot.ips.iter().find(|a| a.is_ipv4()) else {
-            return Err((
-                "socks-rejected",
-                "target host has no IPv4 for socks4".into(),
-            ));
-        };
+        let inner = self
+            .socks5_handshake(tcp, c, &slot.target.host, slot.target.port, connected)
+            .await?;
+        self.tunneled_get(inner, connected, plain_target, c.addr.ip(), slot)
+            .await
+    }
+
+    /// socks4 handshake only: v4-literal CONNECT (no proxy-side DNS).
+    async fn socks4_handshake(
+        &self,
+        mut tcp: TcpStream,
+        c: &Candidate,
+        ip: std::net::Ipv4Addr,
+        port: u16,
+        connected: Instant,
+    ) -> Result<TcpStream, Fail> {
         let userid = match &c.auth {
             Some(a) => format!("{}\0", a.user),
             None => "proxalyze\0".to_string(),
         };
         let pkt: Vec<u8> = [
             &[0x04u8, 0x01u8][..],
-            &slot.target.port.to_be_bytes(),
+            &port.to_be_bytes(),
             &ip.octets(),
             userid.as_bytes(),
         ]
@@ -590,7 +733,28 @@ impl Validator {
         .await
         .map_err(|_| ("socks-rejected", "socks4 timeout".to_string()))??;
         interpret_socks4_reply(reply)?;
-        self.tunneled_get(tcp, connected, plain_target, c.addr.ip(), slot)
+        Ok(tcp)
+    }
+
+    /// socks4: v4-literal handshake (no proxy-side DNS), optional TLS, GET.
+    async fn socks4_get(
+        &self,
+        tcp: TcpStream,
+        connected: Instant,
+        plain_target: bool,
+        c: &Candidate,
+        slot: &TargetSlot,
+    ) -> Result<ProbeResult, Fail> {
+        let Some(&IpAddr::V4(ip)) = slot.ips.iter().find(|a| a.is_ipv4()) else {
+            return Err((
+                "socks-rejected",
+                "target host has no IPv4 for socks4".into(),
+            ));
+        };
+        let inner = self
+            .socks4_handshake(tcp, c, ip, slot.target.port, connected)
+            .await?;
+        self.tunneled_get(inner, connected, plain_target, c.addr.ip(), slot)
             .await
     }
 
@@ -610,21 +774,76 @@ impl Validator {
         if plain_target {
             let uri = format!("http://{}{}", slot.authority, slot.target.path);
             let req = self.request(&uri, Some(&slot.authority), None)?;
-            return self.run_conn(io, req, connected, proxy_ip).await;
+            // SOCKS credentials rode the handshake, so the follow-ups must
+            // not repeat them as Proxy-Authorization.
+            let extras = self.extras(&uri, Some(&slot.authority), None);
+            return self
+                .run_conn(io, req, connected, proxy_ip, extras.as_ref())
+                .await;
         }
         let tls = self
             .tls_wrap(&self.tls_verified, io, connected, &slot.target.host)
             .await?;
         let req = self.request(&slot.target.path, Some(&slot.authority), None)?;
-        self.run_conn(tls, req, connected, proxy_ip)
+        let extras = self.extras(&slot.target.path, Some(&slot.authority), None);
+        self.run_conn(tls, req, connected, proxy_ip, extras.as_ref())
             .await
             .map_err(bump_tls)
+    }
+
+    /// Capability follow-up context for a flow, or `None` when the probe is
+    /// off — which is what keeps the default run's wire shape untouched.
+    fn extras<'a>(
+        &self,
+        target_url: &'a str,
+        origin_host: Option<&'a str>,
+        auth: Option<&'a Auth>,
+    ) -> Option<ConnExtras<'a>> {
+        if !self.cfg.probe_capabilities {
+            return None;
+        }
+        Some(ConnExtras {
+            target_url,
+            origin_host,
+            auth,
+        })
     }
 
     // ---- shared pieces ------------------------------------------------
 
     fn remaining(&self, connected: Instant) -> Duration {
         self.cfg.total_timeout.saturating_sub(connected.elapsed())
+    }
+
+    /// Shared header assembly for both request builders, so the primary GET
+    /// and the chunked POST cannot drift. `keep_alive` = omit
+    /// `Connection: close` (HTTP/1.1 then keeps the socket open, which the
+    /// capability follow-ups need); the default run keeps the header exactly
+    /// as it always was.
+    fn request_builder(
+        &self,
+        method: http::Method,
+        uri: &str,
+        origin_host: Option<&str>,
+        auth: Option<&Auth>,
+        keep_alive: bool,
+    ) -> http::request::Builder {
+        let mut b = http::Request::builder().method(method).uri(uri);
+        if let Some(h) = origin_host {
+            b = b.header(http::header::HOST, h);
+        }
+        b = b
+            .header(http::header::ACCEPT, "*/*")
+            .header(http::header::USER_AGENT, user_agent());
+        if !keep_alive {
+            b = b.header(http::header::CONNECTION, "close");
+        }
+        if let Some(a) = auth {
+            let pass = a.password.clone().unwrap_or_default();
+            let value = format!("Basic {}", b64(&format!("{}:{}", a.user, pass)));
+            b = b.header(http::header::PROXY_AUTHORIZATION, value);
+        }
+        b
     }
 
     /// Build the check request. `origin_host` = Some ⇒ origin-form GET with
@@ -635,21 +854,34 @@ impl Validator {
         uri: &str,
         origin_host: Option<&str>,
         auth: Option<&Auth>,
-    ) -> Result<http::Request<Empty<Bytes>>, Fail> {
-        let mut b = http::Request::get(uri);
-        if let Some(h) = origin_host {
-            b = b.header(http::header::HOST, h);
-        }
-        b = b
-            .header(http::header::ACCEPT, "*/*")
-            .header(http::header::USER_AGENT, user_agent())
-            .header(http::header::CONNECTION, "close");
-        if let Some(a) = auth {
-            let pass = a.password.clone().unwrap_or_default();
-            let value = format!("Basic {}", b64(&format!("{}:{}", a.user, pass)));
-            b = b.header(http::header::PROXY_AUTHORIZATION, value);
-        }
-        b.body(Empty::new())
+    ) -> Result<http::Request<BoxedBody>, Fail> {
+        self.request_keep_alive(uri, origin_host, auth, self.cfg.probe_capabilities)
+    }
+
+    fn request_keep_alive(
+        &self,
+        uri: &str,
+        origin_host: Option<&str>,
+        auth: Option<&Auth>,
+        keep_alive: bool,
+    ) -> Result<http::Request<BoxedBody>, Fail> {
+        self.request_builder(http::Method::GET, uri, origin_host, auth, keep_alive)
+            .body(ProbeBody::Empty)
+            .map(|req| req.map(http_body_util::combinators::BoxBody::new))
+            .map_err(|e| ("tcp-alive", e.to_string()))
+    }
+
+    /// POST with a length-less body ⇒ `Transfer-Encoding: chunked` on the wire.
+    fn request_chunked_post(
+        &self,
+        uri: &str,
+        origin_host: Option<&str>,
+        auth: Option<&Auth>,
+    ) -> Result<http::Request<BoxedBody>, Fail> {
+        self.request_builder(http::Method::POST, uri, origin_host, auth, true)
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .body(ProbeBody::Chunked(Some(CHUNKED_POST_BODY)))
+            .map(|req| req.map(http_body_util::combinators::BoxBody::new))
             .map_err(|e| ("tcp-alive", e.to_string()))
     }
 
@@ -737,13 +969,17 @@ impl Validator {
         .map_err(|_| ("tcp-alive", "CONNECT timeout".to_string()))?
     }
 
-    /// Drive one hyper HTTP/1 connection, read the body, classify.
+    /// Drive one hyper HTTP/1 connection, read the body, classify, and — when
+    /// `extras` is present — probe the connection's protocol capabilities
+    /// before it closes. Capability outcomes are decoration only: they can
+    /// add or omit `caps` entries, never change the verdict.
     async fn run_conn<I>(
         &self,
         io: I,
-        req: http::Request<Empty<Bytes>>,
+        req: http::Request<BoxedBody>,
         connected: Instant,
         proxy_ip: IpAddr,
+        extras: Option<&ConnExtras<'_>>,
     ) -> Result<ProbeResult, Fail>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -787,6 +1023,31 @@ impl Validator {
             Ok::<_, Fail>((status, body, ttfb_ms))
         })
         .await;
+        // A live connection is the only place keep-alive / chunked-POST can
+        // be observed, so the follow-ups ride it — while `sender` and the
+        // connection driver are still alive. Their cost is decoration: it is
+        // subtracted from total_ms, and a failure only omits caps entries.
+        let mut caps: Vec<&'static str> = Vec::new();
+        let mut decor_ms = 0u32;
+        if let Some(x) = extras
+            && outcome
+                .as_ref()
+                .is_ok_and(|o| matches!(o, Ok((200..=299, _, _))))
+        {
+            let probed = tokio::time::timeout(
+                self.remaining(connected),
+                self.capability_probes(&mut sender, x),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                if self.cfg.debug {
+                    qeprintln!("[capability] follow-up budget exhausted");
+                }
+                (Vec::new(), 0)
+            });
+            caps = probed.0;
+            decor_ms = probed.1;
+        }
         drop(sender);
         driver.abort();
         let (status, body, ttfb_ms) =
@@ -807,8 +1068,8 @@ impl Validator {
             fail_reason: None,
             kbps: None,
             speed_tier: None,
-            caps: Vec::new(),
-            decor_ms: 0,
+            caps,
+            decor_ms,
         };
         match status {
             407 => return Err(("auth-required", "407 from proxy".to_string())),
@@ -894,7 +1155,7 @@ impl Validator {
     async fn read_once<I>(
         &self,
         io: I,
-        req: http::Request<Empty<Bytes>>,
+        req: http::Request<BoxedBody>,
         budget: Duration,
     ) -> Result<(u16, Bytes), Fail>
     where
@@ -930,6 +1191,238 @@ impl Validator {
         drop(sender);
         driver.abort();
         outcome.map_err(|_| ("tcp-alive", "shape-check timeout".into()))?
+    }
+
+    /// Two follow-ups on an already-open connection: a plain second GET
+    /// (any response ⇒ keep-alive worked) and a chunked POST (a status that
+    /// is not 400/411/501 ⇒ the origin accepted a chunked body). Every error
+    /// is swallowed: the caller decorates `caps`, never the verdict.
+    /// Returns the tag list plus the summed elapsed wall time.
+    async fn capability_probes(
+        &self,
+        sender: &mut hyper::client::conn::http1::SendRequest<BoxedBody>,
+        x: &ConnExtras<'_>,
+    ) -> (Vec<&'static str>, u32) {
+        let mut caps = Vec::new();
+        let mut decor_ms = 0u32;
+
+        let t0 = Instant::now();
+        let keep_alive: Result<u16, String> =
+            match self.request_keep_alive(x.target_url, x.origin_host, x.auth, true) {
+                Ok(req) => match sender.send_request(req).await {
+                    // Drain before the next request: hyper will not write it
+                    // while this response is unread.
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let _ = resp.into_body().collect().await;
+                        Ok(status)
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                Err((_, e)) => Err(e),
+            };
+        decor_ms = decor_ms.saturating_add(ms_since(t0));
+        match keep_alive {
+            Ok(status) => {
+                if self.cfg.debug {
+                    qeprintln!("[capability] keep-alive probe answered {status}");
+                }
+                caps.push("keep-alive");
+            }
+            Err(e) => {
+                if self.cfg.debug {
+                    qeprintln!("[capability] keep-alive probe failed: {e}");
+                }
+            }
+        }
+
+        let t0 = Instant::now();
+        let chunked: Result<u16, String> =
+            match self.request_chunked_post(x.target_url, x.origin_host, x.auth) {
+                Ok(req) => match sender.send_request(req).await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let _ = resp.into_body().collect().await;
+                        Ok(status)
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                Err((_, e)) => Err(e),
+            };
+        decor_ms = decor_ms.saturating_add(ms_since(t0));
+        match chunked {
+            Ok(status) if !matches!(status, 400 | 411 | 501) => {
+                if self.cfg.debug {
+                    qeprintln!("[capability] chunked POST answered {status}");
+                }
+                caps.push("chunked-post");
+            }
+            Ok(status) => {
+                if self.cfg.debug {
+                    qeprintln!("[capability] chunked POST refused with {status}");
+                }
+            }
+            Err(e) => {
+                if self.cfg.debug {
+                    qeprintln!("[capability] chunked POST failed: {e}");
+                }
+            }
+        }
+        (caps, decor_ms)
+    }
+
+    /// Time a download through an open tunneled connection. Reads body
+    /// frames until the response ends or the sample cap is reached — hitting
+    /// the cap is the normal success path, not an error, and a body that
+    /// ends early still yields the bytes it delivered.
+    async fn timed_download<I>(
+        &self,
+        io: I,
+        req: http::Request<BoxedBody>,
+        budget: Duration,
+    ) -> Result<(u64, u32), Fail>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if budget.is_zero() {
+            return Err(("tcp-alive", "budget exhausted".into()));
+        }
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .title_case_headers(false)
+            .handshake(hyper_util::rt::TokioIo::new(io))
+            .await
+            .map_err(|e| ("tcp-alive", e.to_string()))?;
+        let driver = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let outcome = tokio::time::timeout(budget, async {
+            let t0 = Instant::now();
+            let resp = sender
+                .send_request(req)
+                .await
+                .map_err(|e| ("tcp-alive", e.to_string()))?;
+            let status = resp.status().as_u16();
+            if !(200..=299).contains(&status) {
+                return Err::<_, Fail>(("tcp-alive", format!("target status {status}")));
+            }
+            let mut body = resp.into_body();
+            let mut bytes = 0u64;
+            while let Some(item) = body.frame().await {
+                let frame = item.map_err(|e| ("tcp-alive", e.to_string()))?;
+                if let Ok(data) = frame.into_data() {
+                    // Clamp inside the frame: a peer that coalesces 300 KiB
+                    // into one frame must still sample exactly the cap, so
+                    // the throughput figure reflects a fixed sample size.
+                    let take = data
+                        .len()
+                        .min(THROUGHPUT_MAX.saturating_sub(bytes as usize));
+                    bytes += take as u64;
+                    if bytes as usize >= THROUGHPUT_MAX {
+                        break;
+                    }
+                }
+            }
+            Ok((
+                bytes,
+                u32::try_from(t0.elapsed().as_millis()).unwrap_or(u32::MAX),
+            ))
+        })
+        .await;
+        drop(sender);
+        driver.abort();
+        outcome.map_err(|_| ("tcp-alive", "throughput timeout".to_string()))?
+    }
+
+    /// Second dial through the same proxy, download the sample, and report
+    /// kbps. `None` on any failure — a missing speed figure is decoration, so
+    /// a proxy that cannot serve the sample stays live.
+    async fn throughput_probe(&self, c: &Candidate) -> Option<u32> {
+        let t = self.throughput.as_ref()?;
+        // Fresh budget: the echo's dial-anchored remainder is ~0 by now, and
+        // a ~0 budget would starve every slow-but-live proxy of a speed tier.
+        let start = Instant::now();
+        let tcp = tokio::time::timeout(self.cfg.connect_timeout, TcpStream::connect(c.addr))
+            .await
+            .ok()?
+            .ok()?;
+        let _ = tcp.set_nodelay(true);
+
+        // Layering mirrors the check flows exactly: proxy-facing TLS is
+        // verification-off (self-signed proxy endpoints), origin-facing TLS
+        // is verified (the sample host must not be forgeable).
+        let (io, uri, origin_host): (BoxedIo, String, Option<String>) = match c.scheme {
+            Scheme::Http | Scheme::Https => {
+                let io: BoxedIo = if t.check.tls {
+                    let mut tcp = tcp;
+                    self.connect_phase(&mut tcp, start, &t.authority, c.auth.as_ref())
+                        .await
+                        .ok()?;
+                    let tls = self
+                        .tls_wrap(&self.tls_verified, tcp, start, &t.check.host)
+                        .await
+                        .ok()?;
+                    Box::new(tls)
+                } else if matches!(c.scheme, Scheme::Https) {
+                    let tls = self
+                        .tls_wrap(&self.tls_verify_off, tcp, start, &t.check.host)
+                        .await
+                        .ok()?;
+                    Box::new(tls)
+                } else {
+                    Box::new(tcp)
+                };
+                if t.check.tls {
+                    (io, t.check.path.clone(), Some(t.authority.clone()))
+                } else {
+                    (io, t.check.url.clone(), None)
+                }
+            }
+            Scheme::Socks5 | Scheme::Socks4 => {
+                let inner = match c.scheme {
+                    Scheme::Socks5 => self
+                        .socks5_handshake(tcp, c, &t.check.host, t.check.port, start)
+                        .await
+                        .ok()?,
+                    _ => {
+                        let Some(&IpAddr::V4(ip)) = t.ips.iter().find(|a| a.is_ipv4()) else {
+                            return None; // socks4 has no proxy-side DNS
+                        };
+                        self.socks4_handshake(tcp, c, ip, t.check.port, start)
+                            .await
+                            .ok()?
+                    }
+                };
+                if t.check.tls {
+                    let tls = self
+                        .tls_wrap(&self.tls_verified, inner, start, &t.check.host)
+                        .await
+                        .ok()?;
+                    (
+                        Box::new(tls),
+                        t.check.path.clone(),
+                        Some(t.authority.clone()),
+                    )
+                } else {
+                    let uri = format!("http://{}{}", t.authority, t.check.path);
+                    (Box::new(inner), uri, Some(t.authority.clone()))
+                }
+            }
+        };
+
+        let req = self
+            .request_keep_alive(&uri, origin_host.as_deref(), c.auth.as_ref(), true)
+            .ok()?;
+        let budget = self.cfg.total_timeout.saturating_sub(start.elapsed());
+        let (bytes, elapsed_ms) = self.timed_download(io, req, budget).await.ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        if self.cfg.debug {
+            qeprintln!("[throughput] {bytes} bytes in {elapsed_ms} ms");
+        }
+        // u64 intermediates: at the 256 KiB cap and a 1 ms floor this is
+        // 2_097_152_000, which fits u32 only because of that floor.
+        Some(u32::try_from(bytes * 8 * 1000 / elapsed_ms.max(1) as u64).unwrap_or(u32::MAX))
     }
 }
 
@@ -1211,6 +1704,9 @@ mod tests {
                 connect_timeout: Duration::from_secs(1),
                 total_timeout: Duration::from_secs(1),
                 debug: false,
+                probe_capabilities: false,
+                probe_throughput: false,
+                throughput: None,
             },
             slots: Vec::new(),
             rr: AtomicUsize::new(0),
@@ -1218,7 +1714,74 @@ mod tests {
             tls_verify_off: Arc::new(tls_config(false).unwrap()),
             tls_verified: Arc::new(tls_config(true).unwrap()),
             done: Arc::new(AtomicUsize::new(0)),
+            throughput: None,
         }
+    }
+
+    /// Scripted HTTP/1.1 peer: reads a whole request (head plus any
+    /// chunked body), answers with the next scripted response, and returns
+    /// every request head it saw.
+    async fn serve(mut client: tokio::io::DuplexStream, responses: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        // One buffer across the whole script: hyper pipelines, so a later
+        // request can arrive in the same read as an earlier one's head.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        for response in responses {
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = client.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return seen;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            // A chunked request's body trails its head; consume the terminal
+            // chunk so the client's next write cannot deadlock on it.
+            let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            let chunked = head.contains("transfer-encoding: chunked");
+            if chunked {
+                while !buf.windows(5).any(|w| w == b"0\r\n\r\n") {
+                    let n = client.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return seen;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+            let end = if chunked {
+                buf.windows(5)
+                    .position(|w| w == b"0\r\n\r\n")
+                    .map(|p| p + 5)
+                    .unwrap_or(buf.len())
+            } else {
+                buf.windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(buf.len())
+            };
+            seen.push(buf[..end].to_vec());
+            buf.drain(..end);
+            if client.write_all(&response).await.is_err() {
+                return seen;
+            }
+            let _ = client.flush().await;
+        }
+        seen
+    }
+
+    fn ok_body() -> Vec<u8> {
+        let body = b"{\"origin\":\"127.0.0.1\"}";
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn check_uri() -> String {
+        "http://echo.test/ip".into()
     }
 
     async fn respond_to_connect(mut client: tokio::io::DuplexStream, response: &'static [u8]) {
@@ -1412,5 +1975,122 @@ mod tests {
             matches!(shape, Shape::Wrong(detail) if detail == "oversized response"),
             "an oversized reachable response is a wrong body shape, not unreachable"
         );
+    }
+
+    #[test]
+    fn speed_tier_thresholds_are_exact() {
+        assert_eq!(speed_tier_of(2048), "fast");
+        assert_eq!(speed_tier_of(2047), "mid");
+        assert_eq!(speed_tier_of(512), "mid");
+        assert_eq!(speed_tier_of(511), "slow");
+    }
+
+    #[tokio::test]
+    async fn timed_download_caps_at_256k_without_touching_echo_cap() {
+        let (client, mut peer) = tokio::io::duplex(1024 * 1024);
+        let body = vec![b'x'; 300 * 1024];
+        let head_out = {
+            let mut all =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len()).into_bytes();
+            all.extend_from_slice(&body);
+            all
+        };
+        let server = tokio::spawn(async move {
+            // Read the request head first: hyper writes nothing until the
+            // peer is listening.
+            let mut chunk = [0u8; 512];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = peer.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let _ = peer.write_all(&head_out).await;
+            let _ = peer.flush().await;
+            // hold the stream open past the cap so the reader stops on it
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let v = validator();
+        let req = v
+            .request_keep_alive("http://x.test/big", Some("x.test"), None, true)
+            .unwrap();
+        let (bytes, _elapsed) = v
+            .timed_download(client, req, Duration::from_secs(5))
+            .await
+            .expect("hitting the throughput cap is success, not an oversized error");
+        server.abort();
+
+        assert!(
+            (1..=(THROUGHPUT_MAX as u64)).contains(&bytes),
+            "sample must stop at the 256 KiB cap, got {bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_probe_failure_keeps_live_verdict() {
+        let (client, peer) = tokio::io::duplex(8192);
+        // Answers the primary GET, then hangs up: both follow-ups fail.
+        let server = tokio::spawn(async move {
+            let _ = serve(peer, vec![ok_body()]).await;
+        });
+
+        let mut v = validator();
+        v.cfg.probe_capabilities = true;
+        let uri = check_uri();
+        let req = v.request(&uri, None, None).unwrap();
+        let extras = v.extras(&uri, None, None).unwrap();
+        let r = v
+            .run_conn(client, req, Instant::now(), ip("127.0.0.1"), Some(&extras))
+            .await
+            .expect("a broken follow-up must not fail the check");
+        let _ = server.await;
+
+        assert_eq!(r.status, "live");
+        assert_eq!(r.anonymity, Some("elite"));
+        assert_eq!(r.fail_reason, None);
+        assert!(
+            r.caps.is_empty(),
+            "a peer that hangs up supports neither capability: {:?}",
+            r.caps
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_alive_and_chunked_tags_on_successful_followups() {
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        let post_ok = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec();
+        let server =
+            tokio::spawn(async move { serve(peer, vec![ok_body(), ok_body(), post_ok]).await });
+
+        let mut v = validator();
+        v.cfg.probe_capabilities = true;
+        let uri = check_uri();
+        let req = v.request(&uri, None, None).unwrap();
+        let extras = v.extras(&uri, None, None).unwrap();
+        let r = v
+            .run_conn(client, req, Instant::now(), ip("127.0.0.1"), Some(&extras))
+            .await
+            .expect("three answered requests are a live proxy");
+        let seen = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("peer should have served all three requests")
+            .unwrap();
+
+        let head = String::from_utf8_lossy(&seen[0]).to_ascii_lowercase();
+        assert!(
+            !head.contains("connection: close"),
+            "the primary request must stay open for the follow-ups: {head}"
+        );
+        let chunked = String::from_utf8_lossy(&seen[2]).to_ascii_lowercase();
+        assert!(
+            chunked.contains("transfer-encoding: chunked"),
+            "the POST body has no length, so it must be chunked: {chunked}"
+        );
+        let mut caps = r.caps.clone();
+        caps.sort_unstable();
+        assert_eq!(caps, ["chunked-post", "keep-alive"]);
     }
 }
