@@ -130,6 +130,11 @@ fn resolve_backup_urls(user: &[String]) -> Vec<String> {
     }
 }
 
+/// Trimmed tag tokens, stored ready for both validation and matching.
+fn normalized_tags(raw: &[String]) -> Vec<String> {
+    raw.iter().map(|t| t.trim().to_string()).collect()
+}
+
 fn build_config(cli: &Cli) -> Result<Config, String> {
     let inputs = if cli.inputs.is_empty() {
         vec![InputFile {
@@ -179,10 +184,17 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
             dir: cli.out.clone(),
         },
         filters: config::Filters {
-            require_tags: cli.require_tag.clone(),
-            exclude_tags: cli.exclude_tag.clone(),
+            // Normalized here, once: `Config::check` validates the trimmed
+            // form and `apply_filters` compares these exact values, so a
+            // padded CLI token can't validate as a known tag yet match
+            // nothing at filter time.
+            require_tags: normalized_tags(&cli.require_tag),
+            exclude_tags: normalized_tags(&cli.exclude_tag),
             max_speed: cli.max_speed,
-            min_anonymity: cli.min_anonymity.clone(),
+            min_anonymity: cli
+                .min_anonymity
+                .as_deref()
+                .map(|a| a.trim().to_ascii_lowercase()),
             countries,
             keep_top: cli.keep_top,
         },
@@ -847,6 +859,43 @@ mod tests {
     use super::*;
     use model::Scheme;
     use std::cell::Cell;
+
+    /// The values `apply_filters` compares must be the normalized ones, or a
+    /// padded token validates as a known tag yet matches no record.
+    #[test]
+    fn build_config_stores_normalized_filter_values() {
+        let cli = Cli::parse_from([
+            "proxalyze",
+            "-i",
+            "proxies.txt",
+            "--require-tag",
+            " hosting",
+            "--exclude-tag",
+            " vpn ",
+            "--min-anonymity",
+            " Elite ",
+            "--country",
+            " fr , de",
+        ]);
+        let cfg = build_config(&cli).expect("valid filters must build");
+        assert_eq!(cfg.filters.require_tags, vec!["hosting".to_string()]);
+        assert_eq!(cfg.filters.exclude_tags, vec!["vpn".to_string()]);
+        assert_eq!(cfg.filters.min_anonymity.as_deref(), Some("elite"));
+        assert_eq!(
+            cfg.filters.countries,
+            vec!["FR".to_string(), "DE".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_country_with_no_code() {
+        let cli = Cli::parse_from(["proxalyze", "-i", "proxies.txt", "--country", " , "]);
+        let err = build_config(&cli).unwrap_err();
+        assert!(
+            err.contains("--country requires at least one ISO code"),
+            "{err}"
+        );
+    }
 
     fn host(name: &str, port: u16, scheme: Scheme, auth: Option<model::Auth>) -> HostEntry {
         HostEntry {

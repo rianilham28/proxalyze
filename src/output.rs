@@ -190,12 +190,10 @@ pub fn apply_filters(records: &mut Vec<LiveRecord>, f: &Filters) -> (usize, usiz
         let require = &f.require_tags;
         let exclude = &f.exclude_tags;
         let max_speed = f.max_speed;
-        let floor = f
-            .min_anonymity
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .map(|a| if a == "anonymous" { 1u8 } else { 0u8 });
+        let floor = f.min_anonymity.as_deref().map(str::trim).map(|a| match a {
+            "anonymous" => 1u8,
+            _ => 0u8,
+        });
         let countries = &f.countries;
         records.retain(|r| {
             if !require.iter().all(|t| r.tags.iter().any(|x| x == t)) {
@@ -211,12 +209,17 @@ pub fn apply_filters(records: &mut Vec<LiveRecord>, f: &Filters) -> (usize, usiz
                 return false;
             }
             if !countries.is_empty() {
-                match r.country.as_deref() {
+                // Every arm must decide: a record with a country outside the
+                // list is dropped, not merely "kept with a country".
+                let wanted = match r.country.as_deref() {
                     Some(c) => countries
                         .iter()
                         .any(|w| w.trim().eq_ignore_ascii_case(c.trim())),
-                    None => return false,
+                    None => false,
                 };
+                if !wanted {
+                    return false;
+                }
             }
             true
         });
@@ -709,15 +712,21 @@ mod tests {
         r
     }
 
-    fn with_speed(ms: u32) -> LiveRecord {
-        let mut r = tagged(&[]);
-        r.speed_ms = ms;
+    /// A record with a distinct identity, so "which record survived" is
+    /// checkable rather than merely "how many did".
+    fn ident(last: u8, tags: &'static [&'static str]) -> LiveRecord {
+        let mut r = rec("http", &format!("192.0.2.{last}:8080"));
+        r.tags = tags.to_vec();
         r
     }
 
-    fn with_anonymity(kind: &'static str) -> LiveRecord {
+    fn addrs(records: &[LiveRecord]) -> Vec<&str> {
+        records.iter().map(|r| r.proxy.as_str()).collect()
+    }
+
+    fn with_speed(ms: u32) -> LiveRecord {
         let mut r = tagged(&[]);
-        r.anonymity = Some(kind);
+        r.speed_ms = ms;
         r
     }
 
@@ -768,35 +777,126 @@ mod tests {
 
     #[test]
     fn min_anonymity_floor_elite_drops_transparent_unjudged_auth() {
-        let mut v = vec![
-            with_anonymity("elite"),
-            with_anonymity("anonymous"),
-            with_anonymity("transparent"),
-            tagged(&[]),
-            tagged(&["auth-required"]),
+        let recs = [
+            (1u8, "elite", &[][..]),
+            (2, "anonymous", &[][..]),
+            (3, "transparent", &[][..]),
+            (4, "", &[][..]),
+            (5, "", &["auth-required"][..]),
         ];
+        let mut v: Vec<LiveRecord> = recs
+            .iter()
+            .map(|(n, a, t)| {
+                let mut r = ident(*n, t);
+                r.anonymity = if a.is_empty() { None } else { Some(*a) };
+                r
+            })
+            .collect();
         let f = Filters {
             min_anonymity: Some("elite".into()),
             ..Default::default()
         };
         assert_eq!(apply_filters(&mut v, &f), (1, 4));
+        assert_eq!(
+            addrs(&v),
+            vec!["http://192.0.2.1:8080"],
+            "only the elite record survives; anonymous/transparent/unjudged/auth all go"
+        );
     }
 
     #[test]
-    fn country_filter_drops_records_without_country() {
-        let mut fr = tagged(&[]);
+    fn country_filter_keeps_only_listed_countries() {
+        let mut fr = ident(1, &[]);
         fr.country = Some("FR".into());
-        let mut v = vec![fr, tagged(&[])];
+        let mut de = ident(2, &[]);
+        de.country = Some("DE".into());
+        let mut us = ident(3, &[]);
+        us.country = Some("US".into());
+        let mut v = vec![fr, de, us, ident(4, &[])];
         let f = Filters {
-            countries: vec!["fr".into()],
+            countries: vec!["fr".into(), "de".into()],
+            ..Default::default()
+        };
+        assert_eq!(apply_filters(&mut v, &f), (2, 2));
+        assert_eq!(
+            addrs(&v),
+            vec!["http://192.0.2.1:8080", "http://192.0.2.2:8080"],
+            "US and the country-less record must both be dropped"
+        );
+    }
+
+    #[test]
+    fn tag_gates_select_the_matching_record_only() {
+        let mut v = vec![ident(1, &["hosting"]), ident(2, &["cdn"])];
+        let f = Filters {
+            require_tags: vec!["hosting".into()],
             ..Default::default()
         };
         assert_eq!(apply_filters(&mut v, &f), (1, 1));
+        assert_eq!(addrs(&v), vec!["http://192.0.2.1:8080"]);
+
+        let mut v = vec![ident(1, &["hosting"]), ident(2, &["cdn"])];
+        let f = Filters {
+            exclude_tags: vec!["hosting".into()],
+            ..Default::default()
+        };
+        assert_eq!(apply_filters(&mut v, &f), (1, 1));
+        assert_eq!(addrs(&v), vec!["http://192.0.2.2:8080"]);
+    }
+
+    #[test]
+    fn max_speed_keeps_exactly_the_in_boundary_set() {
+        let mut v = vec![ident(1, &[]), ident(2, &[]), ident(3, &[])];
+        for (i, ms) in [100u32, 500, 501].into_iter().enumerate() {
+            v[i].speed_ms = ms;
+        }
+        let f = Filters {
+            max_speed: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(apply_filters(&mut v, &f), (2, 1));
+        assert_eq!(
+            addrs(&v),
+            vec!["http://192.0.2.1:8080", "http://192.0.2.2:8080"],
+            "500 is the inclusive boundary; 501 must go"
+        );
+    }
+
+    #[test]
+    fn min_anonymity_floor_anonymous_keeps_two_ranks() {
+        let recs = [
+            (1u8, "elite", &[][..]),
+            (2, "anonymous", &[][..]),
+            (3, "transparent", &[][..]),
+            (4, "", &[][..]),
+            (5, "", &["auth-required"][..]),
+        ];
+        let mut v: Vec<LiveRecord> = recs
+            .iter()
+            .map(|(n, a, t)| {
+                let mut r = ident(*n, t);
+                r.anonymity = if a.is_empty() { None } else { Some(*a) };
+                r
+            })
+            .collect();
+        let f = Filters {
+            min_anonymity: Some("anonymous".into()),
+            ..Default::default()
+        };
+        assert_eq!(apply_filters(&mut v, &f), (2, 3));
+        assert_eq!(
+            addrs(&v),
+            vec!["http://192.0.2.1:8080", "http://192.0.2.2:8080"],
+            "the anonymous floor keeps ranks 0-1; transparent/unjudged/auth go"
+        );
     }
 
     #[test]
     fn keep_top_truncates_sorted_prefix() {
-        let mut v = vec![with_speed(10), with_speed(20), with_speed(30)];
+        let mut v = vec![ident(1, &[]), ident(2, &[]), ident(3, &[])];
+        for (i, ms) in [10u32, 20, 30].into_iter().enumerate() {
+            v[i].speed_ms = ms;
+        }
         let f = Filters {
             keep_top: Some(2),
             ..Default::default()
@@ -807,27 +907,45 @@ mod tests {
             vec![10, 20],
             "top-N must truncate the head of the already-sorted list"
         );
+        assert_eq!(
+            addrs(&v),
+            vec!["http://192.0.2.1:8080", "http://192.0.2.2:8080"],
+            "the two FASTEST records survive, not the first two by position"
+        );
     }
 
     #[test]
     fn keep_top_zero_empties_and_counts_as_active() {
-        let mut v = vec![with_speed(10), with_speed(20), with_speed(30)];
+        let mut v = vec![ident(1, &[]), ident(2, &[]), ident(3, &[])];
+        for (i, ms) in [10u32, 20, 30].into_iter().enumerate() {
+            v[i].speed_ms = ms;
+        }
         let f = Filters {
             keep_top: Some(0),
             ..Default::default()
         };
         assert_eq!(apply_filters(&mut v, &f), (0, 3));
         assert!(f.is_active());
+        assert!(addrs(&v).is_empty(), "keep-top 0 must empty the list");
     }
 
     #[test]
     fn inactive_filters_change_nothing() {
-        let mut v = vec![with_speed(30), with_speed(10), with_speed(20)];
-        let before: Vec<u32> = v.iter().map(|r| r.speed_ms).collect();
+        let mut v = vec![ident(1, &[]), ident(2, &[]), ident(3, &[])];
+        for (i, ms) in [30u32, 10, 20].into_iter().enumerate() {
+            v[i].speed_ms = ms;
+        }
+        let before = addrs(&v)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let f = Filters::default();
         assert_eq!(apply_filters(&mut v, &f), (3, 0));
         assert!(!f.is_active());
-        let after: Vec<u32> = v.iter().map(|r| r.speed_ms).collect();
-        assert_eq!(after, before);
+        assert_eq!(
+            addrs(&v),
+            before.iter().map(String::as_str).collect::<Vec<_>>(),
+            "identity and order both preserved"
+        );
     }
 }
