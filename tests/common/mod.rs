@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -38,58 +39,91 @@ pub struct EchoServer {
     pub addr: SocketAddr,
     accepts: Arc<AtomicUsize>,
     targets: Arc<Mutex<Vec<String>>>,
+    /// Connections that presented a second request head — PER-CONNECTION
+    /// reuse, not a global request count: one connection serving four
+    /// requests is one hit.
+    keepalive: Arc<AtomicUsize>,
+    /// `Transfer-Encoding` values observed, recorded alongside `targets` so
+    /// a chunked-POST probe can be identified after the fact.
+    transfer_encodings: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+/// Everything one `EchoServer` instance shares with its per-connection
+/// threads, and the static facts about what it serves.
+#[derive(Clone)]
+struct EchoFixture {
+    mode: EchoMode,
+    status: u16,
+    /// Bytes served on any `/big` path; `None` disables the endpoint.
+    big_body: Option<usize>,
+    accepts: Arc<AtomicUsize>,
+    targets: Arc<Mutex<Vec<String>>>,
+    keepalive: Arc<AtomicUsize>,
+    transfer_encodings: Arc<Mutex<Vec<String>>>,
+    /// GET-only: the first GET the server ever sees is the startup
+    /// shape-check and must consume the own-egress response. POSTs never
+    /// take an ordinal.
+    get_ordinal: Arc<AtomicUsize>,
+}
+
+/// A chunked-POST capability probe is a POST, never a check: dispatching on
+/// method first keeps the ordinal reserved for the GET shape-check.
+const POST_ACK: &str = "ok";
+
+/// Bodies larger than a one-liner can't live in `EchoMode::body`'s
+/// `&'static str`, so the throughput sample is served from a path instead.
+const BIG_PATH: &str = "/big";
+
+/// Requests served per accepted stream before the mock closes. Bounded so a
+/// client that never goes away cannot pin a mock thread.
+const MAX_REQUESTS_PER_CONNECTION: usize = 4;
+
+/// The startup shape-check must consume the own-egress response; a static
+/// server otherwise cannot tell elite from anonymous.
+const OWN_EGRESS: &str = "198.51.100.9";
+
 impl EchoServer {
     pub fn start(mode: EchoMode, status: u16) -> Self {
+        Self::build(mode, status, None)
+    }
+
+    /// Also serve `size` bytes on any path ending in `/big`, for
+    /// `--probe-throughput` (whose sample cap is 256 KiB — far past what an
+    /// `EchoMode` body can hold).
+    pub fn start_with_big_body(mode: EchoMode, size: usize) -> Self {
+        Self::build(mode, 200, Some(size))
+    }
+
+    fn build(mode: EchoMode, status: u16, big_body: Option<usize>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
         let targets = Arc::new(Mutex::new(Vec::new()));
-        let thread_accepts = accepts.clone();
-        let thread_targets = targets.clone();
+        let keepalive = Arc::new(AtomicUsize::new(0));
+        let transfer_encodings = Arc::new(Mutex::new(Vec::new()));
+        let fixture = EchoFixture {
+            mode,
+            status,
+            big_body,
+            accepts: accepts.clone(),
+            targets: targets.clone(),
+            keepalive: keepalive.clone(),
+            transfer_encodings: transfer_encodings.clone(),
+            get_ordinal: Arc::new(AtomicUsize::new(0)),
+        };
         let stop = Arc::new(AtomicBool::new(false));
+        let thread_fixture = fixture.clone();
         let thread_stop = stop.clone();
-        let request_number = Arc::new(AtomicUsize::new(0));
-        let thread_request_number = request_number.clone();
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        thread_accepts.fetch_add(1, Ordering::SeqCst);
-                        let targets = thread_targets.clone();
-                        let request_number = thread_request_number.clone();
-                        let _ = thread::spawn(move || {
-                            let mut stream = stream;
-                            make_blocking(&stream);
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(1)))
-                                .unwrap();
-                            let Some(request) = read_http_head(&mut stream) else {
-                                return;
-                            };
-                            let request_line = request.lines().next().unwrap_or_default();
-                            let target = request_line
-                                .split_whitespace()
-                                .nth(1)
-                                .unwrap_or_default()
-                                .to_owned();
-                            targets.lock().unwrap().push(target);
-                            let ordinal = request_number.fetch_add(1, Ordering::SeqCst);
-                            // classify captures own egress before judging candidates.
-                            // A static server therefore cannot distinguish elite and
-                            // anonymous: the startup request must consume the own-IP
-                            // response, and candidate requests receive the mode body.
-                            let body = if ordinal == 0 {
-                                "198.51.100.9"
-                            } else {
-                                mode.body()
-                            };
-                            write_http_response(&mut stream, status, body);
-                        });
+                        thread_fixture.accepts.fetch_add(1, Ordering::SeqCst);
+                        let fixture = thread_fixture.clone();
+                        let _ = thread::spawn(move || handle_echo(stream, &fixture));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
@@ -102,6 +136,8 @@ impl EchoServer {
             addr,
             accepts,
             targets,
+            keepalive,
+            transfer_encodings,
             stop,
             thread: Some(thread),
         }
@@ -111,8 +147,79 @@ impl EchoServer {
         self.accepts.load(Ordering::SeqCst)
     }
 
+    /// Connections that served a second request head on the same stream.
+    pub fn keepalive_hits(&self) -> usize {
+        self.keepalive.load(Ordering::SeqCst)
+    }
+
     pub fn targets(&self) -> Vec<String> {
         self.targets.lock().unwrap().clone()
+    }
+
+    pub fn transfer_encodings(&self) -> Vec<String> {
+        self.transfer_encodings.lock().unwrap().clone()
+    }
+
+    /// `targets()` after the detached per-connection threads have had a
+    /// chance to record, or a panic once `timeout` elapses. A connection
+    /// handler records from its own thread, so an immediate read after the
+    /// child exits can otherwise miss a request that DID arrive.
+    pub fn wait_for_targets(&self, min: usize, timeout: Duration) -> Vec<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let targets = self.targets();
+            if targets.len() >= min || std::time::Instant::now() >= deadline {
+                return targets;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Requests on one connection: method first (a chunked-POST capability
+/// probe is a POST and is acknowledged, never answered with an IP body),
+/// then path, and only then the global GET ordinal.
+fn handle_echo(mut stream: TcpStream, fixture: &EchoFixture) {
+    make_blocking(&stream);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut served = 0usize;
+    while served < MAX_REQUESTS_PER_CONNECTION {
+        let Some(head) = read_http_head(&mut stream) else {
+            return;
+        };
+        served += 1;
+        if served == 2 {
+            // A second head on the SAME stream is per-connection reuse.
+            fixture.keepalive.fetch_add(1, Ordering::SeqCst);
+        }
+        let request_line = head.lines().next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default().to_owned();
+        fixture.targets.lock().unwrap().push(target.clone());
+        if let Some(encoding) = header_value(&head, "transfer-encoding") {
+            fixture
+                .transfer_encodings
+                .lock()
+                .unwrap()
+                .push(encoding.to_owned());
+        }
+        // Owned because the big-body arm sizes itself in bytes rather than
+        // borrowing a `&'static str`.
+        let body: Cow<'_, str> = if method.eq_ignore_ascii_case("POST") {
+            Cow::Borrowed(POST_ACK)
+        } else if fixture.big_body.is_some_and(|_| target.ends_with(BIG_PATH)) {
+            Cow::Owned("x".repeat(fixture.big_body.unwrap_or_default()))
+        } else if fixture.get_ordinal.fetch_add(1, Ordering::SeqCst) == 0 {
+            Cow::Borrowed(OWN_EGRESS)
+        } else {
+            Cow::Borrowed(fixture.mode.body())
+        };
+        if write_http_response(&mut stream, fixture.status, &body, head_wants_close(&head)) {
+            return;
+        }
     }
 }
 
@@ -134,7 +241,22 @@ pub struct HttpProxyMock {
     pub addr: SocketAddr,
     accepts: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    /// Connections that presented a second request head — per-connection
+    /// reuse, so one connection serving several requests is one hit.
+    keepalive: Arc<AtomicUsize>,
+    /// Per-request capture of the forward path, where the capability
+    /// follow-ups actually land: an HTTP proxy answers them itself, so the
+    /// echo never sees them.
+    requests: Arc<Mutex<Vec<RequestCapture>>>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// One forwarded request, as the proxy received it.
+#[derive(Clone, Debug)]
+pub struct RequestCapture {
+    pub method: String,
+    pub target: String,
+    pub transfer_encoding: Option<String>,
 }
 
 impl HttpProxyMock {
@@ -164,6 +286,10 @@ impl HttpProxyMock {
         let addr = listener.local_addr().unwrap();
         let accepts = Arc::new(AtomicUsize::new(0));
         let thread_accepts = accepts.clone();
+        let keepalive = Arc::new(AtomicUsize::new(0));
+        let thread_keepalive = keepalive.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = requests.clone();
         let thread_auth = Arc::new(required_auth);
         let shared_body = Arc::new(body);
         let stop = Arc::new(AtomicBool::new(false));
@@ -174,9 +300,18 @@ impl HttpProxyMock {
                     Ok((stream, _)) => {
                         thread_accepts.fetch_add(1, Ordering::SeqCst);
                         let auth = thread_auth.clone();
+                        let keepalive = thread_keepalive.clone();
+                        let requests = thread_requests.clone();
                         let body = shared_body.clone();
                         let _ = thread::Builder::new().spawn(move || {
-                            handle_http_proxy(stream, auth.as_ref().as_ref(), &body, status)
+                            handle_http_proxy(
+                                stream,
+                                auth.as_ref().as_ref(),
+                                &body,
+                                status,
+                                keepalive,
+                                requests,
+                            )
                         });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -189,6 +324,8 @@ impl HttpProxyMock {
         Self {
             addr,
             accepts,
+            keepalive,
+            requests,
             stop,
             thread: Some(thread),
         }
@@ -196,6 +333,30 @@ impl HttpProxyMock {
 
     pub fn accepts(&self) -> usize {
         self.accepts.load(Ordering::SeqCst)
+    }
+
+    /// Connections that served more than one request head.
+    pub fn keepalive_hits(&self) -> usize {
+        self.keepalive.load(Ordering::SeqCst)
+    }
+
+    /// Every request the forward path received, in arrival order.
+    pub fn requests(&self) -> Vec<RequestCapture> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// Wait until the forward path has recorded `min` requests, so a caller
+    /// that reads immediately after the child exits cannot race the
+    /// per-connection threads.
+    pub fn wait_for_requests(&self, min: usize, timeout: Duration) -> Vec<RequestCapture> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let captured = self.requests();
+            if captured.len() >= min || std::time::Instant::now() >= deadline {
+                return captured;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -210,33 +371,76 @@ fn handle_http_proxy(
     auth: Option<&(String, String)>,
     body: &str,
     status: u16,
+    keepalive: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<RequestCapture>>>,
 ) {
     make_blocking(&stream);
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
-    let Some(head) = read_http_head(&mut stream) else {
-        return;
-    };
-    let first = head.lines().next().unwrap_or_default();
-    if let Some(authority) = connect_authority(first) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    // Bounded loop: a capability probe rides the SAME connection for a
+    // keep-alive GET and a chunked POST, so a mock that answered once and
+    // dropped the stream could never earn either tag. Closing after a
+    // response happens only when the CLIENT asked for it, or the request
+    // budget is spent.
+    let mut served = 0usize;
+    while served < MAX_REQUESTS_PER_CONNECTION {
+        let Some(head) = read_http_head(&mut stream) else {
+            return;
+        };
+        served += 1;
+        if served == 2 {
+            // A second head on the SAME stream is per-connection reuse.
+            keepalive.fetch_add(1, Ordering::SeqCst);
+        }
+        let first = head.lines().next().unwrap_or_default();
+        let mut parts = first.split_whitespace();
+        requests.lock().unwrap().push(RequestCapture {
+            method: parts.next().unwrap_or_default().to_owned(),
+            target: parts.next().unwrap_or_default().to_owned(),
+            transfer_encoding: header_value(&head, "transfer-encoding").map(str::to_owned),
+        });
+        if connect_authority(first).is_some() {
+            // A tunnel consumes the connection outright.
+            serve_connect(&mut stream, &head, auth);
+            return;
+        }
         if auth.is_some_and(|(u, p)| !has_basic_auth(&head, u, p)) {
-            write_http_response(&mut stream, 407, "proxy authentication required");
-        } else if let Ok(target) = TcpStream::connect(authority) {
+            if write_http_response(&mut stream, 407, "proxy authentication required", true) {
+                return;
+            }
+            continue;
+        }
+        if write_http_response(&mut stream, status, body, head_wants_close(&head)) {
+            return;
+        }
+    }
+}
+
+/// CONNECT is terminal: once the tunnel is up the socket belongs to the
+/// relay, not to the request loop.
+fn serve_connect(stream: &mut TcpStream, head: &str, auth: Option<&(String, String)>) {
+    let authority = match connect_authority(head.lines().next().unwrap_or_default()) {
+        Some(authority) => authority,
+        None => return,
+    };
+    if auth.is_some_and(|(u, p)| !has_basic_auth(head, u, p)) {
+        let _ = write_http_response(stream, 407, "proxy authentication required", true);
+        return;
+    }
+    match TcpStream::connect(authority) {
+        Ok(target) => {
             target
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
-            stream
+            if stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .unwrap();
-            relay_bidirectional(stream.try_clone().unwrap(), target);
-        } else {
-            write_http_response(&mut stream, 502, "connect failed");
+                .is_ok()
+            {
+                relay_bidirectional(stream.try_clone().unwrap(), target);
+            }
         }
-    } else if auth.is_some_and(|(u, p)| !has_basic_auth(&head, u, p)) {
-        write_http_response(&mut stream, 407, "proxy authentication required");
-    } else {
-        write_http_response(&mut stream, status, body);
+        Err(_) => {
+            let _ = write_http_response(stream, 502, "connect failed", true);
+        }
     }
 }
 
@@ -391,11 +595,19 @@ impl TestDir {
         &self.0
     }
 }
-
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// `command(&dir)` plus the caller's flags, in one spawn. `command` already
+/// supplies `--backup-url ""`, so no caller ever re-spells the network-free
+/// boilerplate.
+pub fn run_with(test_dir: &TestDir, args: &[&str]) -> Output {
+    let mut cmd = command(test_dir);
+    cmd.args(args);
+    run(&mut cmd)
 }
 
 pub fn command(test_dir: &TestDir) -> Command {
@@ -423,6 +635,7 @@ fn read_http_head(stream: &mut TcpStream) -> Option<String> {
         if n == 0 {
             break;
         }
+
         bytes.extend_from_slice(&buf[..n]);
         if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
             break;
@@ -434,13 +647,37 @@ fn read_http_head(stream: &mut TcpStream) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+/// Write one response. Returns `true` when the caller must close the
+/// connection: either the client asked for it, or the write failed. A
+/// `Content-Length`-delimited body lets a keep-alive client read to
+/// completion and reuse the stream, which is what the capability follow-ups
+/// need.
+fn write_http_response(stream: &mut TcpStream, status: u16, body: &str, close: bool) -> bool {
     let reason = if status == 200 { "OK" } else { "Error" };
+    let connection = if close { "close" } else { "keep-alive" };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
+    // The write MUST happen regardless of `close`: `close || write` would
+    // short-circuit and answer `Connection: close` clients with silence.
+    stream.write_all(response.as_bytes()).is_err() || close
+}
+
+/// The client's own `Connection: close` — the only thing that may close a
+/// response-delivering connection before its request budget is spent.
+fn head_wants_close(head: &str) -> bool {
+    header_value(head, "connection")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("close"))
+}
+
+/// Case-insensitive header lookup in a raw request head.
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        line.split_once(':')
+            .filter(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    })
 }
 
 fn has_basic_auth(head: &str, user: &str, password: &str) -> bool {

@@ -540,3 +540,657 @@ fn dropping_a_mock_releases_its_listener() {
     }
     assert!(released, "mock listener still owns {addr}");
 }
+
+// ---------------------------------------------------------------------------
+// Task 6: integration + regression coverage for the extensions plan (write-stage
+// filters, extra output formats, cross-run stability, throughput + capability
+// probes). Every peer is a 127.0.0.1 mock; `common::run_with` supplies
+// `--backup-url ""` and the short timeouts.
+// ---------------------------------------------------------------------------
+
+/// Two live elite proxies. A hermetic run has no GeoLite2 database, so the
+/// `hosting` tag the geo judge would produce is planted by hand instead.
+fn filters_fixture(name: &str) -> (EchoServer, HttpProxyMock, HttpProxyMock, TestDir) {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let first = HttpProxyMock::open("127.0.0.1");
+    let second = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new(name);
+    let input = dir.path().join("input.txt");
+    std::fs::write(
+        &input,
+        format!(
+            "127.0.0.1:{}\n127.0.0.1:{}\n",
+            first.addr.port(),
+            second.addr.port()
+        ),
+    )
+    .unwrap();
+    // BOTH mocks must be returned: a dropped one releases its listener and
+    // the input line pointing at it is then a dead candidate.
+    (echo, first, second, dir)
+}
+
+/// Add one tag to every record of the pool on disk, so the next run starts
+/// from a prior pool without dialing anything.
+fn plant_tag(dir: &TestDir, tag: &str) {
+    let path = dir.path().join("proxies.jsonl");
+    let body = std::fs::read_to_string(&path).unwrap();
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mut tags = tags_of(&value);
+        tags.push(tag.to_owned());
+        value["tags"] = serde_json::json!(tags);
+        lines.push(serde_json::to_string(&value).unwrap());
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+}
+
+fn tags_of(row: &serde_json::Value) -> Vec<String> {
+    row["tags"]
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| tag.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_tagged(row: &serde_json::Value, tag: &str) -> bool {
+    tags_of(row).iter().any(|owned| owned == tag)
+}
+
+/// `--check-url` for the mock echo, as a borrowed str for a `run_with` arg.
+fn check_url(echo: &EchoServer) -> String {
+    format!("http://{}/ip", echo.addr)
+}
+
+#[test]
+fn filter_to_zero_writes_empty_and_min_live_exits_3() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("filter_to_zero");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            // No mock emits a residential-proxy tag, so the require gate
+            // empties the pool.
+            "--require-tag",
+            "residential-proxy",
+            "--min-live",
+            "1",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr(&output).contains("min-live: 0 live < required 1"),
+        "{}",
+        stderr(&output)
+    );
+    for name in ["proxies.txt", "proxies.jsonl"] {
+        let path = dir.path().join(name);
+        assert!(path.exists(), "{name} must be written even when empty");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "{name} size");
+    }
+}
+
+#[test]
+fn reused_pool_filtered_to_zero_writes_empty_files() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("reused_filtered_to_zero");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let first = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "-j",
+            "1",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(records(&dir.path().join("proxies.jsonl")).len(), 1);
+
+    // The candidate line stays, so `--skip-recent` reuses it: the second run
+    // has zero candidates to PROBE and a non-empty pooled set. The write
+    // guard keys on that pre-filter set, so it must write empties rather
+    // than take the "0 candidates" branch.
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "--skip-recent",
+            "999999",
+            "--require-tag",
+            "residential-proxy",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stdout(&output).contains("existing outputs left untouched"),
+        "a pooled run must not take the zero-candidate branch: {}",
+        stdout(&output)
+    );
+    for name in ["proxies.txt", "proxies.jsonl"] {
+        let path = dir.path().join(name);
+        assert!(path.exists(), "{name} must be rewritten");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0, "{name} size");
+    }
+}
+
+#[test]
+fn legacy_prior_jsonl_carries_forward_with_runs_live_default() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("legacy_prior_jsonl");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let first = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "-j",
+            "1",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    // A pre-upgrade row: no runs_live, no kbps, no speed_tier.
+    let path = dir.path().join("proxies.jsonl");
+    let mut legacy: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+    let object = legacy.as_object_mut().unwrap();
+    for key in ["runs_live", "kbps", "speed_tier"] {
+        object.remove(key);
+    }
+    std::fs::write(&path, format!("{legacy}\n")).unwrap();
+
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "--skip-recent",
+            "999999",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("prior records unreadable"),
+        "a legacy row must decode: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("reused 1 fresh"),
+        "{}",
+        stdout(&output)
+    );
+    let rows = records(&path);
+    assert_eq!(rows.len(), 1);
+    // Decode default 1 + this run's chain increment. EXACTLY 2 pins that a
+    // reused record is assigned from the prior pool, never incremented on top
+    // of the value it already carried.
+    assert_eq!(rows[0]["runs_live"], 2, "row: {}", rows[0]);
+}
+
+#[test]
+fn stable_tag_appears_on_second_consecutive_live_run() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("stable_tag_chain");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let run = || {
+        common::run_with(
+            &dir,
+            &[
+                "-i",
+                input.to_str().unwrap(),
+                "--check-url",
+                &url,
+                "--stable-after",
+                "2",
+            ],
+        )
+    };
+    let path = dir.path().join("proxies.jsonl");
+
+    let first = run();
+    assert!(first.status.success(), "{}", stderr(&first));
+    let rows = records(&path);
+    assert_eq!(rows.len(), 1);
+    assert!(!is_tagged(&rows[0], "stable"), "row: {}", rows[0]);
+
+    let second = run();
+    assert!(second.status.success(), "{}", stderr(&second));
+    let rows = records(&path);
+    assert_eq!(rows[0]["runs_live"], 2);
+    assert!(is_tagged(&rows[0], "stable"), "row: {}", rows[0]);
+
+    // Dead gap: the record vanishes from the prior pool, so the streak breaks.
+    std::fs::write(&path, "").unwrap();
+    let third = run();
+    assert!(third.status.success(), "{}", stderr(&third));
+    let rows = records(&path);
+    assert_eq!(rows[0]["runs_live"], 1);
+    assert!(!is_tagged(&rows[0], "stable"), "row: {}", rows[0]);
+}
+
+#[test]
+fn default_run_has_no_probe_fields() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("default_no_probe_fields");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "-j",
+            "1",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rows = records(&dir.path().join("proxies.jsonl"));
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert!(row.get("kbps").is_none(), "kbps leaked: {row}");
+    assert!(row.get("speed_tier").is_none(), "speed_tier leaked: {row}");
+    // runs_live is the one always-present counter, even on a default run.
+    assert_eq!(row["runs_live"], 1);
+    for tag in ["stable", "chunked-post", "keep-alive"] {
+        assert!(
+            !is_tagged(row, tag),
+            "default run must not carry {tag}: {row}"
+        );
+    }
+    // No flag, no follow-ups: the mock saw no second request head.
+    assert_eq!(proxy.keepalive_hits(), 0);
+}
+
+#[test]
+fn throughput_large_body_yields_kbps_not_oversized() {
+    // Twice the 256 KiB sample cap, so the probe must stop at the cap rather
+    // than report the body as oversized.
+    const BIG: usize = 512 * 1024;
+    let echo = EchoServer::start_with_big_body(EchoMode::Elite, BIG);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("throughput_big_body");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let big = format!("http://{}/big", echo.addr);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "--probe-throughput",
+            "--throughput-url",
+            &big,
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rows = records(&dir.path().join("proxies.jsonl"));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["anonymity"], "elite", "row: {}", rows[0]);
+    let kbps = rows[0]["kbps"].as_u64().expect("kbps present");
+    assert!(kbps > 0, "kbps must be positive: {kbps}");
+    let tier = rows[0]["speed_tier"].as_str().expect("speed_tier present");
+    assert!(
+        ["fast", "mid", "slow"].contains(&tier),
+        "speed_tier: {tier}"
+    );
+}
+
+#[test]
+fn capability_flags_add_tags_and_keep_verdict_live() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("capability_tags");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "--probe-capabilities",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("integrity 1/1 results ✓"),
+        "the probe must not change the verdict: {}",
+        stdout(&output)
+    );
+    let rows = records(&dir.path().join("proxies.jsonl"));
+    assert_eq!(rows.len(), 1);
+    assert!(is_tagged(&rows[0], "keep-alive"), "row: {}", rows[0]);
+    assert!(is_tagged(&rows[0], "chunked-post"), "row: {}", rows[0]);
+    assert_eq!(rows[0]["anonymity"], "elite", "row: {}", rows[0]);
+
+    // The follow-ups rode ONE connection: the mock saw a second and a third
+    // request head on the same stream, which only its request loop can serve.
+    assert_eq!(
+        proxy.keepalive_hits(),
+        1,
+        "follow-ups must reuse the check connection"
+    );
+    // The chunked proof is a real `Transfer-Encoding: chunked` request head
+    // on the forward path: primary GET, keep-alive GET, chunked POST.
+    let captured = proxy.wait_for_requests(3, std::time::Duration::from_secs(2));
+    assert!(
+        captured.iter().any(|request| request.method == "POST"),
+        "the chunked-POST follow-up must reach the proxy: {captured:?}"
+    );
+    assert!(
+        captured.iter().any(|request| request
+            .transfer_encoding
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))),
+        "no chunked request recorded: {captured:?}"
+    );
+    // The mock's own request loop, not a per-request dial: one connection
+    // carried all three heads.
+    assert_eq!(proxy.accepts(), 1, "captured: {captured:?}");
+}
+
+#[test]
+fn csv_and_curl_written_and_filter_counts_shown() {
+    let (echo, _first, _second, dir) = filters_fixture("csv_and_curl");
+    let input = dir.path().join("input.txt");
+    let url = check_url(&echo);
+    let args = [
+        "-i",
+        input.to_str().unwrap(),
+        "--check-url",
+        &url,
+        "-j",
+        "1",
+        "--csv",
+        "--emit",
+        "curl",
+        "--exclude-tag",
+        "hosting",
+    ];
+    let first = common::run_with(&dir, &args);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let unfiltered = records(&dir.path().join("proxies.jsonl"));
+    assert_eq!(unfiltered.len(), 2);
+    let csv = std::fs::read_to_string(dir.path().join("proxies.csv")).unwrap();
+    let curl = std::fs::read_to_string(dir.path().join("proxies.curl")).unwrap();
+    assert_eq!(
+        csv.lines().count(),
+        unfiltered.len() + 1,
+        "header plus one row per record"
+    );
+    assert_eq!(curl.lines().count(), unfiltered.len());
+    assert!(
+        stdout(&first).contains("filters   kept 2 · dropped 0"),
+        "{}",
+        stdout(&first)
+    );
+
+    // A second REAL run, so the records are freshly derived. Its `hosting`
+    // tag can only come from a GeoLite2 database, which a hermetic test
+    // cannot have — so the formats and the summary must still agree with
+    // each other at the pre-filter count.
+    let second = common::run_with(&dir, &args);
+    assert!(second.status.success(), "{}", stderr(&second));
+    let kept = records(&dir.path().join("proxies.jsonl"));
+    assert_eq!(kept.len(), 2);
+    let csv = std::fs::read_to_string(dir.path().join("proxies.csv")).unwrap();
+    let curl = std::fs::read_to_string(dir.path().join("proxies.curl")).unwrap();
+    assert_eq!(csv.lines().count(), kept.len() + 1);
+    assert_eq!(curl.lines().count(), kept.len());
+    assert!(
+        stdout(&second).contains("filters   kept 2 · dropped 0"),
+        "{}",
+        stdout(&second)
+    );
+}
+
+#[test]
+fn require_and_exclude_same_tag_via_cli_drops_everything() {
+    let (echo, _first, _second, dir) = filters_fixture("require_exclude_same_tag");
+    let input = dir.path().join("input.txt");
+    let url = check_url(&echo);
+    let first = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "-j",
+            "1",
+        ],
+    );
+    assert!(first.status.success(), "{}", stderr(&first));
+    plant_tag(&dir, "hosting");
+
+    // `--skip-recent` reuses the planted pool, so the filter sees the
+    // `hosting` tag a real run would have re-derived from the geo database.
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "--skip-recent",
+            "999999",
+            "--require-tag",
+            "hosting",
+            "--exclude-tag",
+            "hosting",
+        ],
+    );
+    // No --min-live, so an empty pool is a normal successful run.
+    assert!(output.status.success(), "{:?}", output.status.code());
+    assert!(records(&dir.path().join("proxies.jsonl")).is_empty());
+    assert_eq!(
+        std::fs::metadata(dir.path().join("proxies.txt"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(
+        stdout(&output).contains("filters   kept 0 · dropped 2"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn keep_top_zero_via_cli_empties_pool() {
+    let (echo, _first, _second, dir) = filters_fixture("keep_top_zero");
+    let input = dir.path().join("input.txt");
+    let url = check_url(&echo);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "-j",
+            "1",
+            "--keep-top",
+            "0",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(records(&dir.path().join("proxies.jsonl")).is_empty());
+    assert_eq!(
+        std::fs::metadata(dir.path().join("proxies.txt"))
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(
+        stdout(&output).contains("filters   kept 0 · dropped 2"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn emit_rejects_unknown_format() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let proxy = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("emit_unknown_format");
+    let input = dir.path().join("input.txt");
+    std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "--emit",
+            "wget",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let message = stderr(&output);
+    assert!(message.contains("curl"), "must list curl: {message}");
+    assert!(
+        message.contains("playwright"),
+        "must list playwright: {message}"
+    );
+    assert!(!message.contains("panicked"), "{message}");
+    // Config validation precedes every dial, so nothing was written.
+    assert!(!dir.path().join("proxies.jsonl").exists());
+}
+
+#[test]
+fn keep_top_truncates_output_and_summary_counts() {
+    let (echo, _first, _second, dir) = filters_fixture("keep_top_one");
+    let input = dir.path().join("input.txt");
+    let url = check_url(&echo);
+    let output = common::run_with(
+        &dir,
+        &[
+            "-i",
+            input.to_str().unwrap(),
+            "--check-url",
+            &url,
+            "-j",
+            "1",
+            "--keep-top",
+            "1",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let rows = records(&dir.path().join("proxies.jsonl"));
+    assert_eq!(rows.len(), 1, "row: {}", rows[0]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("proxies.txt"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        stdout(&output).contains("filters   kept 1 · dropped 1"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn history_jsonl_appends_across_two_runs_and_delta_is_correct() {
+    let echo = EchoServer::start(EchoMode::Elite, 200);
+    let survivor = HttpProxyMock::open("127.0.0.1");
+    let leaving = HttpProxyMock::open("127.0.0.1");
+    let dir = TestDir::new("history_delta");
+    let both = dir.path().join("both.txt");
+    std::fs::write(
+        &both,
+        format!(
+            "127.0.0.1:{}\n127.0.0.1:{}\n",
+            survivor.addr.port(),
+            leaving.addr.port()
+        ),
+    )
+    .unwrap();
+    let one = dir.path().join("one.txt");
+    std::fs::write(&one, format!("127.0.0.1:{}\n", survivor.addr.port())).unwrap();
+    let url = check_url(&echo);
+    let run = |list: &Path| {
+        common::run_with(
+            &dir,
+            &[
+                "-i",
+                list.to_str().unwrap(),
+                "--check-url",
+                &url,
+                "--history",
+            ],
+        )
+    };
+    // A two-proxy pool, then a one-proxy pool: the second row must report
+    // exactly one removal and no additions.
+    let first = run(&both);
+    assert!(first.status.success(), "{}", stderr(&first));
+    let second = run(&one);
+    assert!(second.status.success(), "{}", stderr(&second));
+
+    let history = records(&dir.path().join("history.jsonl"));
+    assert_eq!(history.len(), 2, "history must append, not rewrite");
+    assert_eq!(history[0]["pool_size"], 2);
+    assert_eq!(history[1]["pool_size"], 1);
+    assert_eq!(history[1]["added"], 0);
+    assert_eq!(history[1]["removed"], 1);
+    for row in &history {
+        // 17 fields, all always written: a consumer never has to tell
+        // "absent" from "zero".
+        assert_eq!(row.as_object().unwrap().len(), 17, "row: {row}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("history.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "history mode {mode:o}");
+    }
+}
