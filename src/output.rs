@@ -278,44 +278,66 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// RFC 4180 cell: quoted only when it carries a delimiter, a quote or a
-/// newline, with inner quotes doubled. Empty optionals become empty cells.
-fn csv_cell(value: &str) -> String {
+/// Push one RFC 4180 cell: quoted only when it carries a delimiter, a quote
+/// or a newline, with inner quotes doubled. Writes straight into `out` so a
+/// row costs no intermediate `String` per column.
+fn push_csv_cell(out: &mut String, value: &str) {
     if value.contains([',', '"', '\r', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
+        out.push('"');
+        for ch in value.chars() {
+            if ch == '"' {
+                out.push_str("\"\"");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('"');
     } else {
-        value.to_owned()
+        out.push_str(value);
     }
 }
 
 /// Fixed CSV column set. `runs_live`/`kbps` (Task 3 schema) stay JSONL-only:
 /// CSV is the stable interchange shape.
 pub fn render_csv(records: &[LiveRecord]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::from(
         "proxy,type,last_checked,speed_ms,connect_ms,ttfb_ms,anonymity,exit_ip,asn,org,tags,source,country\n",
     );
     for r in records {
-        let cells = [
-            r.proxy.as_str(),
-            r.type_,
-            &r.last_checked.to_string(),
-            &r.speed_ms.to_string(),
-            &r.connect_ms.to_string(),
-            &r.ttfb_ms.map(|v| v.to_string()).unwrap_or_default(),
-            r.anonymity.unwrap_or_default(),
-            &r.exit_ip.map(|v| v.to_string()).unwrap_or_default(),
-            &r.asn.map(|v| v.to_string()).unwrap_or_default(),
-            r.org.as_deref().unwrap_or_default(),
-            &r.tags.join(";"),
-            r.source.as_str(),
-            r.country.as_deref().unwrap_or_default(),
-        ];
-        for (index, cell) in cells.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            out.push_str(&csv_cell(cell));
+        // Every column is written positionally; absent optionals push nothing
+        // between the commas, so the row keeps a stable 13-cell shape.
+        push_csv_cell(&mut out, &r.proxy);
+        out.push(',');
+        push_csv_cell(&mut out, r.type_);
+        out.push(',');
+        let _ = write!(out, "{}", r.last_checked);
+        out.push(',');
+        let _ = write!(out, "{}", r.speed_ms);
+        out.push(',');
+        let _ = write!(out, "{}", r.connect_ms);
+        out.push(',');
+        if let Some(v) = r.ttfb_ms {
+            let _ = write!(out, "{v}");
         }
+        out.push(',');
+        push_csv_cell(&mut out, r.anonymity.unwrap_or_default());
+        out.push(',');
+        if let Some(ip) = r.exit_ip {
+            let _ = write!(out, "{ip}");
+        }
+        out.push(',');
+        if let Some(asn) = r.asn {
+            let _ = write!(out, "{asn}");
+        }
+        out.push(',');
+        push_csv_cell(&mut out, r.org.as_deref().unwrap_or_default());
+        out.push(',');
+        push_csv_cell(&mut out, &r.tags.join(";"));
+        out.push(',');
+        push_csv_cell(&mut out, r.source.as_str());
+        out.push(',');
+        push_csv_cell(&mut out, r.country.as_deref().unwrap_or_default());
         out.push('\n');
     }
     out
@@ -338,11 +360,28 @@ pub fn render_curl(records: &[LiveRecord], check_url: &str) -> String {
     }
     out
 }
+/// JS double-quoted literal body: a proxy reaching `render_playwright` can
+/// carry `"` or `\` (decode_record validates nothing), and interpolating it
+/// raw would terminate the string early.
+fn js_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// JS array literal of `--proxy-server=` args (trailing commas are valid JS).
 pub fn render_playwright(records: &[LiveRecord]) -> String {
     let mut out = String::from("[\n");
     for r in records {
-        out.push_str(&format!("  \"--proxy-server={}\",\n", r.proxy));
+        out.push_str("  \"--proxy-server=");
+        out.push_str(&js_quote(&r.proxy));
+        out.push_str("\",\n");
     }
     out.push_str("]\n");
     out
@@ -378,6 +417,9 @@ pub struct HistoryRow {
 pub fn append_history(dir: &Path, row: &HistoryRow) -> Result<usize, String> {
     let path = dir.join("history.jsonl");
     let mut skipped = 0;
+    // A file left unterminated by an interrupted run would otherwise have the
+    // new row fused onto its torn last line, corrupting BOTH.
+    let mut unterminated = false;
     if path.exists() {
         let body = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         for raw in body.split(|b| *b == b'\n') {
@@ -392,6 +434,7 @@ pub fn append_history(dir: &Path, row: &HistoryRow) -> Result<usize, String> {
                 skipped += 1;
             }
         }
+        unterminated = !body.is_empty() && !body.ends_with(b"\n");
     }
     let line = serde_json::to_string(row).map_err(|e| format!("history row: {e}"))?;
     let mut f = open_opts()
@@ -399,6 +442,10 @@ pub fn append_history(dir: &Path, row: &HistoryRow) -> Result<usize, String> {
         .truncate(false)
         .open(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    if unterminated {
+        f.write_all(b"\n")
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     f.write_all(line.as_bytes())
         .and_then(|()| f.write_all(b"\n"))
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -429,7 +476,14 @@ pub fn write_out(
     records: &[LiveRecord],
     check_url: &str,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    // Legacy proxies/ dir (pre-two-file format) is intentionally left in place: deleting an operator-named directory is not our call.
+    // Validate every format BEFORE the first write: a bad renderer name must
+    // not leave a half-updated directory behind. Unreachable via
+    // `Config::check`, but `write_out` is a public entry point.
+    for format in &cfg.emit {
+        if !matches!(format.as_str(), "curl" | "playwright") {
+            return Err(format!("--emit FORMAT must be curl or playwright (got {format})").into());
+        }
+    }
     let path = dir.join("proxies.txt");
     let jpath = dir.join("proxies.jsonl");
     let mut txt_bytes = Vec::new();
@@ -453,13 +507,9 @@ pub fn write_out(
     for format in &cfg.emit {
         let epath = dir.join(format!("proxies.{format}"));
         let body = match format.as_str() {
-            "curl" => render_curl(records, check_url),
             "playwright" => render_playwright(records),
-            other => {
-                return Err(
-                    format!("--emit FORMAT must be curl or playwright (got {other})").into(),
-                );
-            }
+            // validated above
+            _ => render_curl(records, check_url),
         };
         write_atomic(&epath, body.as_bytes())?;
         written.push(epath.display().to_string());
@@ -663,7 +713,11 @@ mod tests {
         let r = rec("http", "1.2.3.4:80");
         write_out(
             &dir,
-            &crate::config::Output::default(),
+            &crate::config::Output {
+                csv: true,
+                emit: vec!["curl".into(), "playwright".into()],
+                ..Default::default()
+            },
             std::slice::from_ref(&r),
             "https://check.example/ip",
         )
@@ -671,7 +725,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for f in ["proxies.txt", "proxies.jsonl"] {
+            for f in [
+                "proxies.txt",
+                "proxies.jsonl",
+                "proxies.csv",
+                "proxies.curl",
+                "proxies.playwright",
+            ] {
                 let mode = std::fs::metadata(dir.join(f)).unwrap().permissions().mode();
                 assert_eq!(mode & 0o777, 0o600, "{f} mode {:o}", mode & 0o777);
             }
@@ -1247,6 +1307,58 @@ mod tests {
         assert!(out.contains("  \"--proxy-server=http://1.2.3.4:8080\",\n"));
         assert!(out.ends_with("]\n"));
         assert_eq!(render_playwright(&[]), "[\n]\n");
+    }
+
+    #[test]
+    fn playwright_escapes_quotes_and_backslashes_in_proxy() {
+        // decode_record accepts ANY proxy string, so a --skip-recent record
+        // can carry a quote or backslash. Interpolating it raw would end the
+        // JS string early and emit invalid JavaScript.
+        let mut r = rec("http", "1.2.3.4:8080");
+        r.proxy = r#"http://user:p"a\ss@1.2.3.4:8080"#.into();
+        let out = render_playwright(&[r]);
+        assert_eq!(
+            out,
+            "[\n  \"--proxy-server=http://user:p\\\"a\\\\ss@1.2.3.4:8080\",\n]\n"
+        );
+        // the arg must not be terminated early: one record, one element
+        assert_eq!(out.matches("\"--proxy-server=").count(), 1);
+        assert!(out.ends_with("\",\n]\n"), "arg shape preserved: {out}");
+    }
+
+    #[test]
+    fn history_terminates_an_unterminated_partial_line_before_appending() {
+        let dir = std::env::temp_dir().join(format!("pxz-history-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        // An interrupted run leaves a torn line with no trailing newline.
+        std::fs::write(&path, b"{\"run_ts\":1,\"liv").unwrap();
+
+        assert_eq!(append_history(&dir, &history_row(2, 3)).unwrap(), 1);
+        let body = std::fs::read(&path).unwrap();
+        assert_eq!(
+            body,
+            [
+                b"{\"run_ts\":1,\"liv\n".to_vec(),
+                format!("{}\n", serde_json::to_string(&history_row(2, 3)).unwrap()).into_bytes(),
+            ]
+            .concat(),
+            "the torn line must be closed, not fused with the new row"
+        );
+        // the new row is independently parseable, not concatenated garbage:
+        // the file must hold exactly two non-empty lines
+        let lines: Vec<&[u8]> = body
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2, "torn line and new row are separate");
+        assert_eq!(
+            serde_json::from_str::<HistoryRow>(std::str::from_utf8(lines[1]).unwrap()).unwrap(),
+            history_row(2, 3)
+        );
+        assert_eq!(append_history(&dir, &history_row(0, 0)).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -497,6 +497,20 @@ fn persisted_record_key(record: &model::LiveRecord) -> Option<String> {
     ))
 }
 
+/// `(added, removed)` between the previous and current pools, by persisted
+/// record key. Records whose key cannot be derived are excluded from BOTH
+/// sides, so an unparseable row never inflates the delta.
+fn pool_delta(current: &[model::LiveRecord], previous: &[model::LiveRecord]) -> (usize, usize) {
+    let current_keys: std::collections::BTreeSet<String> =
+        current.iter().filter_map(persisted_record_key).collect();
+    let previous_keys: std::collections::BTreeSet<String> =
+        previous.iter().filter_map(persisted_record_key).collect();
+    (
+        current_keys.difference(&previous_keys).count(),
+        previous_keys.difference(&current_keys).count(),
+    )
+}
+
 type ReusedByInput = HashMap<usize, usize>;
 
 fn partition_recent(
@@ -866,13 +880,7 @@ async fn async_main(
     // recording: when the zero-candidate guard above skipped the write, the
     // on-disk pool is untouched and a row would read as "everything removed".
     if cfg.output.history && written.is_some() {
-        let current_keys: std::collections::BTreeSet<String> =
-            records.iter().filter_map(persisted_record_key).collect();
-        let previous_keys: std::collections::BTreeSet<String> = previous_pool
-            .iter()
-            .flatten()
-            .filter_map(persisted_record_key)
-            .collect();
+        let (added, removed) = pool_delta(&records, previous_pool.as_deref().unwrap_or_default());
         let (kept, dropped) = filtered;
         let row = output::HistoryRow {
             run_ts: now_secs(),
@@ -890,8 +898,8 @@ async fn async_main(
             kept,
             dropped,
             pool_size: records.len(),
-            added: current_keys.difference(&previous_keys).count(),
-            removed: previous_keys.difference(&current_keys).count(),
+            added,
+            removed,
         };
         let dir = std::path::Path::new(&cfg.output.dir);
         let history_path = dir.join("history.jsonl");
@@ -1333,5 +1341,64 @@ mod tests {
             err.contains("--emit FORMAT must be curl or playwright (got wget)"),
             "{err}"
         );
+    }
+
+    fn pool_rec(proxy: &str, type_: &'static str) -> model::LiveRecord {
+        model::LiveRecord {
+            proxy: proxy.into(),
+            type_,
+            last_checked: 1,
+            speed_ms: 1,
+            connect_ms: 1,
+            ttfb_ms: None,
+            anonymity: None,
+            exit_ip: None,
+            asn: None,
+            org: None,
+            tags: vec![],
+            source: "pool.txt".into(),
+            country: None,
+        }
+    }
+
+    #[test]
+    fn pool_delta_counts_added_and_removed_against_the_previous_pool() {
+        // previous {A, B, C}, current {B, D} → +1 added, -2 removed
+        let previous = vec![
+            pool_rec("http://192.0.2.1:8080", "http"),
+            pool_rec("http://192.0.2.2:8080", "http"),
+            pool_rec("socks5://192.0.2.3:1080", "socks5"),
+        ];
+        let current = vec![
+            pool_rec("http://192.0.2.2:8080", "http"),
+            pool_rec("socks4://192.0.2.4:1080", "socks4"),
+        ];
+        assert_eq!(pool_delta(&current, &previous), (1, 2));
+    }
+
+    #[test]
+    fn pool_delta_ignores_credential_spelling_and_unchanged_pools() {
+        // Same address, different credential text → a different record key,
+        // so both sides shift. An identical pool is a no-op.
+        let previous = vec![pool_rec("http://user:a@192.0.2.1:8080", "http")];
+        let same = vec![pool_rec("http://user:a@192.0.2.1:8080", "http")];
+        assert_eq!(pool_delta(&same, &previous), (0, 0));
+        let recredentialed = vec![pool_rec("http://user:b@192.0.2.1:8080", "http")];
+        assert_eq!(pool_delta(&recredentialed, &previous), (1, 1));
+        assert_eq!(pool_delta(&[], &[]), (0, 0));
+        assert_eq!(pool_delta(&same, &[]), (1, 0));
+        assert_eq!(pool_delta(&[], &previous), (0, 1));
+    }
+
+    #[test]
+    fn pool_delta_excludes_records_with_no_derivable_key() {
+        // No "scheme://" → persisted_record_key is None; the record must not
+        // appear as a removal on either side.
+        let previous = vec![
+            pool_rec("http://192.0.2.1:8080", "http"),
+            pool_rec("not-a-url", "http"),
+        ];
+        let current = vec![pool_rec("not-a-url", "http")];
+        assert_eq!(pool_delta(&current, &previous), (0, 1));
     }
 }
