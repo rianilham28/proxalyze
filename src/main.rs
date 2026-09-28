@@ -91,6 +91,10 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     skip_recent: u64,
 
+    /// Tag records found live in this many consecutive prior runs (0 = off; adds the stable tag)
+    #[arg(long, default_value_t = 0)]
+    stable_after: u32,
+
     /// Record must carry ALL these tags to survive (repeatable)
     #[arg(long = "require-tag")]
     require_tag: Vec<String>,
@@ -515,6 +519,39 @@ fn pool_delta(current: &[model::LiveRecord], previous: &[model::LiveRecord]) -> 
     )
 }
 
+/// Chain `runs_live` across runs from the previous pool and (re)tag `stable`.
+///
+/// OVERWRITE semantics: every record's count is ASSIGNED from `prev`, never
+/// derived from the value it carries. A reused record already holds the
+/// decoded `prev[key]`, so incrementing the carried field would count the
+/// run twice; a probed record holds a placeholder. A key absent from `prev`
+/// broke the streak and restarts at 1.
+fn apply_stability(
+    records: &mut [model::LiveRecord],
+    prev: &HashMap<String, u32>,
+    stable_after: u32,
+) {
+    for record in records {
+        record.runs_live = persisted_record_key(record)
+            .and_then(|key| prev.get(&key).copied())
+            .map_or(1, |prior| prior.saturating_add(1));
+        if stable_after == 0 || record.runs_live < stable_after {
+            record.tags.retain(|tag| *tag != "stable");
+        } else if !record.tags.contains(&"stable") {
+            record.tags.push("stable");
+        }
+    }
+}
+
+/// Prior run's chain counts, keyed by persisted record key. A record with no
+/// derivable key contributes nothing.
+fn previous_runs_live(previous: &[model::LiveRecord]) -> HashMap<String, u32> {
+    previous
+        .iter()
+        .filter_map(|record| persisted_record_key(record).map(|key| (key, record.runs_live)))
+        .collect()
+}
+
 type ReusedByInput = HashMap<usize, usize>;
 
 fn partition_recent(
@@ -780,9 +817,13 @@ async fn async_main(
     );
     let mut reused = Vec::new();
     let mut reused_by_input = HashMap::new();
-    // Read once, before `write_out` overwrites proxies.jsonl: both skip-recent
-    // and the --history pool delta need the PREVIOUS run's records.
+    // Read once, before `write_out` overwrites proxies.jsonl: --skip-recent
+    // partitions against it, the --history pool delta and the --stable-after
+    // chain both consume the same records.
     let jsonl_path = std::path::Path::new(&cfg.output.dir).join("proxies.jsonl");
+    // --skip-recent also reuses the pool: a carried-forward record must chain
+    // its runs_live from the same records it was decoded from.
+    let wants_previous = cfg.output.history || cli.stable_after > 0 || cli.skip_recent > 0;
     let mut previous_pool: Option<Vec<model::LiveRecord>> = None;
     if cli.skip_recent > 0 {
         if !jsonl_path.exists() {
@@ -794,12 +835,12 @@ async fn async_main(
             }
             (candidates, reused, reused_by_input) =
                 partition_recent(candidates, &previous, now_secs(), cli.skip_recent);
-            if cfg.output.history {
+            if wants_previous {
                 previous_pool = Some(previous);
             }
         }
     }
-    if cfg.output.history && previous_pool.is_none() && jsonl_path.exists() {
+    if wants_previous && previous_pool.is_none() && jsonl_path.exists() {
         let (previous, skipped) = read_records(&jsonl_path)?;
         if skipped > 0 {
             qeprintln!("[history] {skipped} prior records unreadable · delta may be off");
@@ -845,6 +886,14 @@ async fn async_main(
         .into());
     }
     records.extend(reused.iter().cloned());
+    // Chain runs_live off the prior pool BEFORE the write-stage filters, so
+    // `--require-tag stable` can select on the fresh verdict. Every record's
+    // count is assigned from the prior pool alone, never from its own field.
+    apply_stability(
+        &mut records,
+        &previous_runs_live(previous_pool.as_deref().unwrap_or_default()),
+        cli.stable_after,
+    );
     let reportable_before_filters = records.len();
     // PRE-filter: the guard keeps its original meaning — only a run with zero
     // candidates AND nothing carried forward skips writing. A pooled run
@@ -1416,5 +1465,65 @@ mod tests {
         ];
         let current = vec![pool_rec("not-a-url", "http")];
         assert_eq!(pool_delta(&current, &previous), (0, 1));
+    }
+
+    fn stability_rec(proxy: &str, runs_live: u32, tags: Vec<&'static str>) -> model::LiveRecord {
+        model::LiveRecord {
+            runs_live,
+            tags,
+            ..pool_rec(proxy, "http")
+        }
+    }
+
+    #[test]
+    fn runs_live_chain_increments_gaps_resets_and_rethresholds() {
+        let prev: HashMap<String, u32> = HashMap::from([(
+            persisted_record_key(&pool_rec("http://192.0.2.1:8080", "http")).unwrap(),
+            1,
+        )]);
+
+        // 1 present in the prior run → 2, which meets --stable-after 2.
+        let mut hit = vec![stability_rec("http://192.0.2.1:8080", 1, vec![])];
+        apply_stability(&mut hit, &prev, 2);
+        assert_eq!(hit[0].runs_live, 2);
+        assert_eq!(hit[0].tags, vec!["stable"]);
+
+        // 2 absent from the prior pool → gap resets the chain to 1, no tag.
+        let mut gap = vec![stability_rec("http://192.0.2.2:8080", 9, vec![])];
+        apply_stability(&mut gap, &prev, 2);
+        assert_eq!(gap[0].runs_live, 1);
+        assert!(!gap[0].tags.contains(&"stable"));
+
+        // 3 same record re-thresholded at 3 → 2 is below it, so a carried
+        // "stable" tag is stripped rather than kept.
+        let mut raised = vec![stability_rec("http://192.0.2.1:8080", 2, vec!["stable"])];
+        apply_stability(&mut raised, &prev, 3);
+        assert_eq!(raised[0].runs_live, 2);
+        assert!(!raised[0].tags.contains(&"stable"));
+
+        // 4 threshold off (0) never tags and strips a carried tag.
+        let mut off = vec![stability_rec("http://192.0.2.1:8080", 2, vec!["stable"])];
+        apply_stability(&mut off, &prev, 0);
+        assert_eq!(off[0].runs_live, 2);
+        assert!(!off[0].tags.contains(&"stable"));
+    }
+
+    #[test]
+    fn reused_record_increments_exactly_once_overwriting_its_own_value() {
+        // A reused record carries runs_live 4 from the previous file, and the
+        // prev map built from that same file holds 4. The result is 5 — not 9
+        // (incrementing the carried field) and not 4 (never incremented).
+        let prev: HashMap<String, u32> = HashMap::from([(
+            persisted_record_key(&pool_rec("http://192.0.2.1:8080", "http")).unwrap(),
+            4,
+        )]);
+        let mut records = vec![stability_rec("http://192.0.2.1:8080", 4, vec![])];
+        apply_stability(&mut records, &prev, 1);
+        assert_eq!(records[0].runs_live, 5);
+        // Already above threshold: the tag is added exactly once.
+        let mut again = vec![stability_rec("http://192.0.2.1:8080", 4, vec!["stable"])];
+        apply_stability(&mut again, &prev, 1);
+        assert_eq!(again[0].runs_live, 5);
+        assert_eq!(again[0].tags, vec!["stable"]);
     }
 }
