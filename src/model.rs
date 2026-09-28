@@ -41,6 +41,17 @@ impl fmt::Display for Scheme {
     }
 }
 
+/// Every network-class tag a record may carry. `--require-tag` /
+/// `--exclude-tag` validate against this list so a typo is a clean config
+/// error instead of a run that silently keeps or drops everything.
+pub const KNOWN_TAGS: &[&str] = &[
+    "hosting",
+    "cdn",
+    "mobile",
+    "vpn",
+    "residential-proxy",
+    "auth-required",
+];
 /// Credentials attached to a list entry (`user:pass@host:port`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Auth {

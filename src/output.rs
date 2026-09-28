@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::config::Output;
+use crate::config::{Filters, Output};
 use crate::model::LiveRecord;
 
 /// Read persisted JSONL records, counting malformed or version-skew lines.
@@ -177,6 +177,54 @@ pub fn sort_records(records: &mut [LiveRecord]) {
         let kb = (rank(b), b.speed_ms, scheme_key(b.type_), addr_of(&b.proxy));
         ka.cmp(&kb)
     });
+}
+
+/// Apply the write-stage filters in the spec-mandated order — require ALL,
+/// exclude NONE, speed, anonymity floor, country — then truncate to
+/// `keep_top`. Four gates share one retain pass; `keep_top` truncates
+/// afterwards so it sees the ranked head of the surviving list.
+/// Returns `(kept, dropped)`.
+pub fn apply_filters(records: &mut Vec<LiveRecord>, f: &Filters) -> (usize, usize) {
+    let before = records.len();
+    if f.is_active() {
+        let require = &f.require_tags;
+        let exclude = &f.exclude_tags;
+        let max_speed = f.max_speed;
+        let floor = f
+            .min_anonymity
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .map(|a| if a == "anonymous" { 1u8 } else { 0u8 });
+        let countries = &f.countries;
+        records.retain(|r| {
+            if !require.iter().all(|t| r.tags.iter().any(|x| x == t)) {
+                return false;
+            }
+            if exclude.iter().any(|t| r.tags.iter().any(|x| x == t)) {
+                return false;
+            }
+            if max_speed.is_some_and(|max| r.speed_ms > max) {
+                return false;
+            }
+            if floor.is_some_and(|floor| rank(r) > floor) {
+                return false;
+            }
+            if !countries.is_empty() {
+                match r.country.as_deref() {
+                    Some(c) => countries
+                        .iter()
+                        .any(|w| w.trim().eq_ignore_ascii_case(c.trim())),
+                    None => return false,
+                };
+            }
+            true
+        });
+        if let Some(n) = f.keep_top {
+            records.truncate(n);
+        }
+    }
+    (records.len(), before - records.len())
 }
 
 #[cfg(unix)]
@@ -653,5 +701,117 @@ mod tests {
         let s = Stats::default();
         assert_eq!(Stats::percentile(&s.live_total_ms, 0.5), 0);
         assert_eq!(Stats::percentile(&[1, 2, 3, 4], 1.0), 4);
+    }
+
+    fn tagged(tags: &'static [&'static str]) -> LiveRecord {
+        let mut r = rec("http", "192.0.2.1:8080");
+        r.tags = tags.to_vec();
+        r
+    }
+
+    fn with_speed(ms: u32) -> LiveRecord {
+        let mut r = tagged(&[]);
+        r.speed_ms = ms;
+        r
+    }
+
+    fn with_anonymity(kind: &'static str) -> LiveRecord {
+        let mut r = tagged(&[]);
+        r.anonymity = Some(kind.into());
+        r
+    }
+
+    #[test]
+    fn require_and_exclude_tag_gates() {
+        let mut v = vec![tagged(&["hosting"])];
+        let mut f = crate::config::Filters::default();
+        f.require_tags = vec!["hosting".into()];
+        assert_eq!(apply_filters(&mut v, &f), (1, 0));
+
+        let mut v = vec![tagged(&["hosting"])];
+        let mut f = crate::config::Filters::default();
+        f.require_tags = vec!["cdn".into()];
+        assert_eq!(apply_filters(&mut v, &f), (0, 1));
+
+        let mut v = vec![tagged(&["hosting"])];
+        let mut f = crate::config::Filters::default();
+        f.exclude_tags = vec!["hosting".into()];
+        assert_eq!(apply_filters(&mut v, &f), (0, 1));
+    }
+
+    #[test]
+    fn require_and_exclude_on_same_tag_drops_record() {
+        let mut v = vec![tagged(&["hosting"])];
+        let mut f = crate::config::Filters::default();
+        f.require_tags = vec!["hosting".into()];
+        f.exclude_tags = vec!["hosting".into()];
+        assert_eq!(apply_filters(&mut v, &f), (0, 1));
+    }
+
+    #[test]
+    fn max_speed_drops_slow_and_keeps_boundary() {
+        let mut v = vec![with_speed(100), with_speed(500), with_speed(501)];
+        let mut f = crate::config::Filters::default();
+        f.max_speed = Some(500);
+        assert_eq!(apply_filters(&mut v, &f), (2, 1));
+    }
+
+    #[test]
+    fn min_anonymity_floor_elite_drops_transparent_unjudged_auth() {
+        let mut v = vec![
+            with_anonymity("elite"),
+            with_anonymity("anonymous"),
+            with_anonymity("transparent"),
+            tagged(&[]),
+            tagged(&["auth-required"]),
+        ];
+        let mut f = crate::config::Filters::default();
+        f.min_anonymity = Some("elite".into());
+        assert_eq!(apply_filters(&mut v, &f), (1, 4));
+    }
+
+    #[test]
+    fn country_filter_drops_records_without_country() {
+        let mut fr = tagged(&[]);
+        fr.country = Some("FR".into());
+        let mut v = vec![fr, tagged(&[])];
+        let mut f = crate::config::Filters::default();
+        f.countries = vec!["fr".into()];
+        assert_eq!(apply_filters(&mut v, &f), (1, 1));
+    }
+
+    #[test]
+    fn keep_top_truncates_sorted_prefix() {
+        let mut v = vec![with_speed(10), with_speed(20), with_speed(30)];
+        let mut f = crate::config::Filters::default();
+        f.keep_top = Some(2);
+        assert_eq!(apply_filters(&mut v, &f), (2, 1));
+        assert_eq!(
+            v.iter().map(|r| r.speed_ms).collect::<Vec<_>>(),
+            vec![10, 20],
+            "top-N must truncate the head of the already-sorted list"
+        );
+    }
+
+    #[test]
+    fn keep_top_zero_empties_and_counts_as_active() {
+        let mut v = vec![with_speed(10), with_speed(20), with_speed(30)];
+        let f = crate::config::Filters {
+            keep_top: Some(0),
+            ..crate::config::Filters::default()
+        };
+        assert_eq!(apply_filters(&mut v, &f), (0, 3));
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn inactive_filters_change_nothing() {
+        let mut v = vec![with_speed(30), with_speed(10), with_speed(20)];
+        let before: Vec<u32> = v.iter().map(|r| r.speed_ms).collect();
+        let f = crate::config::Filters::default();
+        assert_eq!(apply_filters(&mut v, &f), (3, 0));
+        assert!(!f.is_active());
+        let after: Vec<u32> = v.iter().map(|r| r.speed_ms).collect();
+        assert_eq!(after, before);
     }
 }

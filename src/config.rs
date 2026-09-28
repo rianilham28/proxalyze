@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::model::Scheme;
+use crate::model::{KNOWN_TAGS, Scheme};
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -15,6 +15,38 @@ pub struct Config {
     pub asn_db: Option<String>,
     pub output: Output,
     pub city_db: Option<String>,
+    pub filters: Filters,
+}
+
+/// Write-stage record filters. All default-off: a run with the default
+/// `Filters` keeps every reportable record, in sorted order, untouched.
+#[derive(Debug, Clone, Default)]
+pub struct Filters {
+    /// Record must carry ALL of these tags to survive.
+    pub require_tags: Vec<String>,
+    /// Record carrying ANY of these tags is dropped (exclude wins).
+    pub exclude_tags: Vec<String>,
+    /// Drop records whose speed_ms exceeds this value.
+    pub max_speed: Option<u32>,
+    /// Anonymity floor: "elite" (rank 0 only) or "anonymous" (rank 0-1).
+    pub min_anonymity: Option<String>,
+    /// ISO 3166-1 alpha-2 exit countries, stored uppercase.
+    pub countries: Vec<String>,
+    /// Keep only the first N records of the sorted list.
+    pub keep_top: Option<usize>,
+}
+
+impl Filters {
+    /// True when any filter is set — drives the summary's `filters` line, so
+    /// the default transcript stays byte-identical.
+    pub fn is_active(&self) -> bool {
+        !self.require_tags.is_empty()
+            || !self.exclude_tags.is_empty()
+            || self.max_speed.is_some()
+            || self.min_anonymity.is_some()
+            || !self.countries.is_empty()
+            || self.keep_top.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +178,34 @@ impl Config {
             ));
         }
 
+        if let Some(floor) = &self.filters.min_anonymity {
+            let norm = floor.trim().to_ascii_lowercase();
+            if !matches!(norm.as_str(), "elite" | "anonymous") {
+                return Err(format!(
+                    "--min-anonymity must be elite or anonymous (got \"{floor}\")"
+                ));
+            }
+        }
+        let known = KNOWN_TAGS.join(", ");
+        for (flag, tags) in [
+            ("--require-tag", &self.filters.require_tags),
+            ("--exclude-tag", &self.filters.exclude_tags),
+        ] {
+            for t in tags {
+                if !KNOWN_TAGS.contains(&t.trim()) {
+                    return Err(format!("unknown tag \"{t}\" in {flag} (known: {known})"));
+                }
+            }
+        }
+        for c in &self.filters.countries {
+            let c = c.trim();
+            let ok = c.len() == 2 && c.chars().all(|ch| ch.is_ascii_alphabetic());
+            if !ok {
+                return Err(format!(
+                    "--country expects ISO 3166-1 alpha-2 codes (got \"{c}\")"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -335,5 +395,40 @@ mod tests {
 
         let host_only = parse_target("https://example.org").unwrap();
         assert_eq!(host_only.path, "/");
+    }
+
+    fn valid_http_config() -> Config {
+        Config {
+            inputs: vec![InputFile {
+                path: "proxies.txt".into(),
+                scheme: "http".into(),
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn unknown_require_tag_is_clean_error_listing_known_tags() {
+        let mut cfg = valid_http_config();
+        cfg.filters.require_tags = vec!["quantum".into()];
+        let err = cfg.check().unwrap_err();
+        assert!(err.contains("--require-tag"), "{err}");
+        assert!(err.contains("residential-proxy"), "{err}");
+    }
+
+    #[test]
+    fn min_anonymity_rejects_other_than_elite_or_anonymous() {
+        let mut cfg = valid_http_config();
+        cfg.filters.min_anonymity = Some("eliteish".into());
+        assert!(cfg.check().unwrap_err().contains("--min-anonymity"));
+    }
+
+    #[test]
+    fn country_rejects_non_iso2_tokens() {
+        let mut cfg = valid_http_config();
+        cfg.filters.countries = vec!["FRA".into()];
+        assert!(cfg.check().unwrap_err().contains("--country"));
+        cfg.filters.countries = vec!["fr".into(), "de".into()];
+        assert!(cfg.check().is_ok());
     }
 }

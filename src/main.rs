@@ -81,15 +81,34 @@ struct Cli {
     #[arg(long)]
     resolve_hostnames: bool,
 
-    /// Exit non-zero (code 3) when fewer than N live survivors are produced;
-    /// 0 disables the gate (CI pipelines that must not accept a silently-empty
-    /// result)
+    /// Exit non-zero (code 3) when fewer than N live survivors are produced,
+    /// counted AFTER write-stage filters; 0 disables the gate (CI pipelines
+    /// that must not accept a silently-empty result)
     #[arg(long, default_value_t = 0)]
     min_live: usize,
 
     /// Skip candidates whose previous proxies.jsonl record is younger than SECONDS (incremental re-check; 0 = off)
     #[arg(long, default_value_t = 0)]
     skip_recent: u64,
+
+    /// Record must carry ALL these tags to survive (repeatable)
+    #[arg(long = "require-tag")]
+    require_tag: Vec<String>,
+    /// Record carrying ANY of these tags is dropped (repeatable)
+    #[arg(long = "exclude-tag")]
+    exclude_tag: Vec<String>,
+    /// Drop records with speed_ms above this value
+    #[arg(long)]
+    max_speed: Option<u32>,
+    /// Keep only this anonymity rank or better: elite | anonymous
+    #[arg(long)]
+    min_anonymity: Option<String>,
+    /// Keep only these ISO country codes, comma-separated (no country → dropped)
+    #[arg(long)]
+    country: Option<String>,
+    /// Keep only the top N records after ranking
+    #[arg(long)]
+    keep_top: Option<usize>,
 }
 
 /// Resource governor: reserve ~20% of the machine's parallelism for
@@ -130,6 +149,20 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
             .collect()
     };
     let backup_urls = resolve_backup_urls(&cli.backup_urls);
+    let countries: Vec<String> = match &cli.country {
+        None => Vec::new(),
+        Some(raw) => {
+            let parsed: Vec<String> = raw
+                .split(',')
+                .map(|c| c.trim().to_ascii_uppercase())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if parsed.is_empty() {
+                return Err("--country requires at least one ISO code".into());
+            }
+            parsed
+        }
+    };
     let cfg = Config {
         debug: cli.debug,
         inputs,
@@ -144,6 +177,14 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
         city_db: detect_city_db(),
         output: config::Output {
             dir: cli.out.clone(),
+        },
+        filters: config::Filters {
+            require_tags: cli.require_tag.clone(),
+            exclude_tags: cli.exclude_tag.clone(),
+            max_speed: cli.max_speed,
+            min_anonymity: cli.min_anonymity.clone(),
+            countries,
+            keep_top: cli.keep_top,
         },
     };
     cfg.check()?;
@@ -482,7 +523,8 @@ type SummaryData<'a> = (
 fn summary(
     stats: &Stats,
     data: &SummaryData<'_>,
-    records: usize,
+    reportable_before_filters: usize,
+    filtered: (usize, usize),
     total: usize,
     reused: usize,
     reused_by_input: &ReusedByInput,
@@ -575,11 +617,15 @@ fn summary(
         qprintln!("            (none)");
     }
     qprintln!(
-        "  integrity {}/{} results ✓ · {} reportable · {records} records ✓ · reused {reused} fresh · probed {total}",
+        "  integrity {}/{} results ✓ · {} reportable · {reportable_before_filters} records ✓ · reused {reused} fresh · probed {total}",
         fmt_n(stats.received),
         fmt_n(total),
         fmt_n(stats.live_total() + stats.auth_required),
     );
+    if cfg.filters.is_active() {
+        let (kept, dropped) = filtered;
+        qprintln!("  filters   kept {kept} · dropped {dropped}");
+    }
 }
 
 fn main() {
@@ -724,12 +770,18 @@ async fn async_main(
         .into());
     }
     records.extend(reused.iter().cloned());
+    let reportable_before_filters = records.len();
+    // PRE-filter: the guard keeps its original meaning — only a run with zero
+    // candidates AND nothing carried forward skips writing. A pooled run
+    // filtered down to zero still falls through and writes EMPTY files.
+    let pooled_empty = records.is_empty();
     let t_write = Instant::now();
-    let written = if total == 0 && records.is_empty() {
+    sort_records(&mut records);
+    let filtered = output::apply_filters(&mut records, &cfg.filters);
+    let written = if total == 0 && pooled_empty {
         qprintln!("[write ] 0 candidates \u{b7} existing outputs left untouched");
         None
     } else {
-        sort_records(&mut records);
         let dir = std::path::Path::new(&cfg.output.dir);
         std::fs::create_dir_all(dir)?;
         Some(write_out(dir, &cfg.output, &records)?)
@@ -757,20 +809,22 @@ async fn async_main(
     summary(
         &stats,
         &(&per_file, &per_target, &labels, &slot_caps, &slot_errors),
-        records.len(),
+        reportable_before_filters,
+        filtered,
         total,
         reused.len(),
         &reused_by_input,
         &cfg,
     );
-    let reused_live = reused
+    // Live survivors AFTER filters — what actually landed in the outputs.
+    let kept_live = records
         .iter()
         .filter(|record| !record.tags.contains(&"auth-required"))
         .count();
-    if cli.min_live > 0 && stats.live_total() + reused_live < cli.min_live {
+    if cli.min_live > 0 && kept_live < cli.min_live {
         qeprintln!(
             "min-live: {} live < required {}",
-            fmt_n(stats.live_total() + reused_live),
+            fmt_n(kept_live),
             fmt_n(cli.min_live)
         );
         std::process::exit(3);
