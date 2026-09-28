@@ -83,16 +83,17 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
 - **Throughput sampling.** `--probe-throughput` (which REQUIRES
   `--throughput-url URL`, or the run fails configuration) times a bounded
   sample download through each live proxy and records `kbps` in kilobits per
-  second — `bytes × 8 ÷ elapsed_ms`, i.e. `bytes × 8 × 1000 / elapsed_ms` — alongside
-  a `speed_tier`: `fast` at ≥ 2048 kbps, `mid` at ≥ 512, `slow` below. The
+  second — `bytes × 8 × 1000 / elapsed_ms`, with `elapsed_ms` in milliseconds
+  and floored at 1 so a sub-millisecond sample cannot divide by zero — and a
+  `speed_tier`: `fast` at ≥ 2048 kbps, `mid` at ≥ 512, `slow` below. The
   sample opens a **second connection through the same proxy** — a SOCKS tunnel
   is one-destination, so the already-open check tunnel cannot carry it — and
   reads at most 256 KiB inside the remaining time budget, so a fast origin
   cannot inflate the figure. Reaching the 256 KiB cap is the normal success
   path, and a body smaller than the cap still measures, so an ordinary
-  `speed.bin` is tiered normally. Only a transport error while reading the
-  body, or an exhausted time budget, yields no figure: the proxy stays live,
-  and the record carries neither `kbps` nor `speed_tier`.
+  `speed.bin` is tiered normally. Only an erroring body read — the frame
+  stream itself failing — or an exhausted time budget yields no figure: the
+  proxy stays live, and the record carries neither `kbps` nor `speed_tier`.
 - **Capability probes.** `--probe-capabilities` sends two follow-ups on the
   live connection and tags `keep-alive` (a second plain GET on the same
   socket) and `chunked-post` (a chunked request body the origin did not
@@ -237,10 +238,10 @@ Each `proxies.jsonl` line has:
   measured throughput in kbit/s and `speed_tier` its bucket — `fast` at
   ≥ 2048 kbps, `mid` at ≥ 512, `slow` below — both present only when
   `--probe-throughput` ran and the sample produced a figure. A body smaller
-  than the 256 KiB cap is a normal measured sample, not a truncated one; only a
-  transport error while reading the body, or an exhausted time budget, leaves
-  the record live with neither key. A `speed_tier` outside `fast`/`mid`/`slow` is
-  version skew, not a free-form label.
+  than the 256 KiB cap is a normal measured sample, not a truncated one; only an
+  erroring body read — the frame stream itself failing — or an exhausted time
+  budget leaves the record live with neither key. A `speed_tier` outside
+  `fast`/`mid`/`slow` is version skew, not a free-form label.
 
 `tags` is a closed vocabulary, interned on decode: `hosting`, `cdn`, `mobile`,
 `vpn`, `residential-proxy`, `auth-required`, `stable`, `chunked-post`, and
