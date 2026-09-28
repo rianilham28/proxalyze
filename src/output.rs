@@ -278,10 +278,156 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// RFC 4180 cell: quoted only when it carries a delimiter, a quote or a
+/// newline, with inner quotes doubled. Empty optionals become empty cells.
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Fixed CSV column set. `runs_live`/`kbps` (Task 3 schema) stay JSONL-only:
+/// CSV is the stable interchange shape.
+pub fn render_csv(records: &[LiveRecord]) -> String {
+    let mut out = String::from(
+        "proxy,type,last_checked,speed_ms,connect_ms,ttfb_ms,anonymity,exit_ip,asn,org,tags,source,country\n",
+    );
+    for r in records {
+        let cells = [
+            r.proxy.as_str(),
+            r.type_,
+            &r.last_checked.to_string(),
+            &r.speed_ms.to_string(),
+            &r.connect_ms.to_string(),
+            &r.ttfb_ms.map(|v| v.to_string()).unwrap_or_default(),
+            r.anonymity.unwrap_or_default(),
+            &r.exit_ip.map(|v| v.to_string()).unwrap_or_default(),
+            &r.asn.map(|v| v.to_string()).unwrap_or_default(),
+            r.org.as_deref().unwrap_or_default(),
+            &r.tags.join(";"),
+            r.source.as_str(),
+            r.country.as_deref().unwrap_or_default(),
+        ];
+        for (index, cell) in cells.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&csv_cell(cell));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Single-quoted shell word: a literal `'` closes, escapes, and reopens.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// One runnable `curl -x` command per record.
+pub fn render_curl(records: &[LiveRecord], check_url: &str) -> String {
+    let mut out = String::new();
+    for r in records {
+        out.push_str(&format!(
+            "curl -x {} {} -sS\n",
+            shell_quote(&r.proxy),
+            shell_quote(check_url)
+        ));
+    }
+    out
+}
+/// JS array literal of `--proxy-server=` args (trailing commas are valid JS).
+pub fn render_playwright(records: &[LiveRecord]) -> String {
+    let mut out = String::from("[\n");
+    for r in records {
+        out.push_str(&format!("  \"--proxy-server={}\",\n", r.proxy));
+    }
+    out.push_str("]\n");
+    out
+}
+
+/// One JSONL row of run stats. Every field is always written so a consumer
+/// never has to distinguish "absent" from "zero".
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HistoryRow {
+    pub run_ts: u64,
+    pub live: usize,
+    pub elite: usize,
+    pub anonymous: usize,
+    pub transparent: usize,
+    pub unjudged: usize,
+    pub auth: usize,
+    pub tls_fail: usize,
+    pub socks_rejected: usize,
+    pub tcp_alive: usize,
+    pub dead: usize,
+    pub median_speed_ms: Option<u32>,
+    pub kept: usize,
+    pub dropped: usize,
+    pub pool_size: usize,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Append one row to `dir/history.jsonl`, returning how many PRE-EXISTING
+/// lines failed to parse. The file is never rewritten: a malformed or
+/// truncated prior line survives verbatim, because a read-and-reserialize
+/// pass would silently destroy history.
+pub fn append_history(dir: &Path, row: &HistoryRow) -> Result<usize, String> {
+    let path = dir.join("history.jsonl");
+    let mut skipped = 0;
+    if path.exists() {
+        let body = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        for raw in body.split(|b| *b == b'\n') {
+            if raw.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if std::str::from_utf8(raw)
+                .ok()
+                .and_then(|line| serde_json::from_str::<HistoryRow>(line).ok())
+                .is_none()
+            {
+                skipped += 1;
+            }
+        }
+    }
+    let line = serde_json::to_string(row).map_err(|e| format!("history row: {e}"))?;
+    let mut f = open_opts()
+        .append(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    f.write_all(line.as_bytes())
+        .and_then(|()| f.write_all(b"\n"))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(skipped)
+}
+
+/// Median `speed_ms` over live records; an even count takes the lower middle.
+/// `auth-required` records are excluded — their timing came from a 407, not
+/// from a completed check.
+pub fn median_speed(records: &[LiveRecord]) -> Option<u32> {
+    let mut speeds: Vec<u32> = records
+        .iter()
+        .filter(|r| !r.tags.contains(&"auth-required"))
+        .map(|r| r.speed_ms)
+        .collect();
+    speeds.sort_unstable();
+    // Lower median: the even-length case takes the element BELOW the midpoint
+    // (10,20,30,40 → 20, not 30).
+    if speeds.is_empty() {
+        return None;
+    }
+    speeds.get((speeds.len() - 1) / 2).copied()
+}
+
 pub fn write_out(
     dir: &Path,
-    _cfg: &Output,
+    cfg: &Output,
     records: &[LiveRecord],
+    check_url: &str,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     // Legacy proxies/ dir (pre-two-file format) is intentionally left in place: deleting an operator-named directory is not our call.
     let path = dir.join("proxies.txt");
@@ -298,10 +444,27 @@ pub fn write_out(
     }
     write_atomic(&path, &txt_bytes)?;
     write_atomic(&jpath, &jsonl_bytes)?;
-    Ok(vec![
-        path.display().to_string(),
-        jpath.display().to_string(),
-    ])
+    let mut written = vec![path.display().to_string(), jpath.display().to_string()];
+    if cfg.csv {
+        let cpath = dir.join("proxies.csv");
+        write_atomic(&cpath, render_csv(records).as_bytes())?;
+        written.push(cpath.display().to_string());
+    }
+    for format in &cfg.emit {
+        let epath = dir.join(format!("proxies.{format}"));
+        let body = match format.as_str() {
+            "curl" => render_curl(records, check_url),
+            "playwright" => render_playwright(records),
+            other => {
+                return Err(
+                    format!("--emit FORMAT must be curl or playwright (got {other})").into(),
+                );
+            }
+        };
+        write_atomic(&epath, body.as_bytes())?;
+        written.push(epath.display().to_string());
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -353,6 +516,7 @@ mod tests {
             &dir,
             &crate::config::Output::default(),
             std::slice::from_ref(&record),
+            "https://check.example/ip",
         )
         .unwrap();
         let (back, skipped) = read_records(&dir.join("proxies.jsonl")).unwrap();
@@ -501,6 +665,7 @@ mod tests {
             &dir,
             &crate::config::Output::default(),
             std::slice::from_ref(&r),
+            "https://check.example/ip",
         )
         .unwrap();
         #[cfg(unix)]
@@ -520,7 +685,13 @@ mod tests {
         let nested = dir.join("proxies");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("keep.txt"), b"mine").unwrap();
-        write_out(&dir, &crate::config::Output::default(), &[]).unwrap();
+        write_out(
+            &dir,
+            &crate::config::Output::default(),
+            &[],
+            "https://check.example/ip",
+        )
+        .unwrap();
         assert!(
             nested.join("keep.txt").exists(),
             "unrelated dir was deleted"
@@ -947,5 +1118,223 @@ mod tests {
             before.iter().map(String::as_str).collect::<Vec<_>>(),
             "identity and order both preserved"
         );
+    }
+
+    fn rich(over: impl FnOnce(&mut LiveRecord)) -> LiveRecord {
+        let mut r = rec("http", "192.0.2.7:8080");
+        r.last_checked = 1_700_000_500;
+        r.speed_ms = 120;
+        r.connect_ms = 30;
+        r.ttfb_ms = Some(90);
+        r.anonymity = Some("elite");
+        r.exit_ip = Some("192.0.2.7".parse().unwrap());
+        r.asn = Some(64512);
+        r.org = Some("Example \"Net\", Ltd".into());
+        r.tags = vec!["vpn", "cdn"];
+        r.country = Some("US".into());
+        over(&mut r);
+        r
+    }
+
+    fn history_row(added: usize, removed: usize) -> HistoryRow {
+        HistoryRow {
+            run_ts: 1_700_000_000,
+            live: 4,
+            elite: 1,
+            anonymous: 2,
+            transparent: 1,
+            unjudged: 0,
+            auth: 0,
+            tls_fail: 1,
+            socks_rejected: 0,
+            tcp_alive: 2,
+            dead: 3,
+            median_speed_ms: Some(120),
+            kept: 4,
+            dropped: 1,
+            pool_size: 4,
+            added,
+            removed,
+        }
+    }
+
+    #[test]
+    fn csv_quotes_commas_and_quotes() {
+        let mut r = rich(|_| {});
+        r.proxy = "http://user:pa,ss@192.0.2.7:8080".into();
+        let csv = render_csv(&[r]);
+        assert_eq!(
+            csv.lines().next().unwrap(),
+            "proxy,type,last_checked,speed_ms,connect_ms,ttfb_ms,anonymity,exit_ip,asn,org,tags,source,country"
+        );
+        assert!(
+            csv.contains("\"http://user:pa,ss@192.0.2.7:8080\""),
+            "a comma field must be quoted whole: {csv}"
+        );
+        assert!(
+            csv.contains("\"Example \"\"Net\"\", Ltd\""),
+            "embedded quotes must be doubled inside a quoted cell: {csv}"
+        );
+        assert!(csv.contains("vpn;cdn"), "tags join with a semicolon: {csv}");
+    }
+
+    #[test]
+    fn csv_row_count_matches_record_count_plus_header() {
+        let recs = [
+            rich(|r| r.proxy = "http://192.0.2.1:8080".into()),
+            rich(|r| r.proxy = "http://192.0.2.2:8080".into()),
+            rich(|r| r.proxy = "http://192.0.2.3:8080".into()),
+        ];
+        let csv = render_csv(&recs);
+        assert_eq!(csv.lines().count(), 4);
+        assert!(csv.ends_with('\n'));
+        assert_eq!(
+            render_csv(&[]).lines().count(),
+            1,
+            "header alone for no records"
+        );
+    }
+
+    #[test]
+    fn csv_leaves_absent_optionals_as_empty_cells() {
+        let mut r = rich(|_| {});
+        r.ttfb_ms = None;
+        r.asn = None;
+        r.org = None;
+        r.country = None;
+        r.anonymity = None;
+        r.exit_ip = None;
+        let row = render_csv(&[r]);
+        let cells: Vec<&str> = row.lines().nth(1).unwrap().split(',').collect();
+        assert_eq!(cells.len(), 13);
+        assert_eq!(cells[3], "120", "speed_ms is present");
+        for empty in [cells[5], cells[6], cells[7], cells[8], cells[9], cells[12]] {
+            assert_eq!(empty, "", "absent optional must render an empty cell");
+        }
+    }
+
+    #[test]
+    fn curl_escapes_single_quotes_in_credentials() {
+        let mut r = rich(|_| {});
+        r.proxy = "http://user:pa'ss@192.0.2.7:8080".into();
+        let out = render_curl(&[r], "https://echo.example/ip");
+        assert!(out.contains("curl -x '"));
+        assert!(!out.contains("pa'ss"), "raw quote leaked: {out}");
+        assert!(
+            out.contains("pa'\\''ss"),
+            "the quote must close, escape, reopen: {out}"
+        );
+        assert!(
+            out.ends_with("' -sS\n"),
+            "one complete line per record: {out}"
+        );
+    }
+
+    #[test]
+    fn curl_uses_the_check_url_verbatim() {
+        let out = render_curl(&[rec("http", "1.2.3.4:8080")], "https://echo.example/ip");
+        assert_eq!(
+            out,
+            "curl -x 'http://1.2.3.4:8080' 'https://echo.example/ip' -sS\n"
+        );
+    }
+
+    #[test]
+    fn playwright_emits_one_proxy_server_arg_per_record() {
+        let out = render_playwright(&[rec("http", "1.2.3.4:8080"), rec("socks5", "5.6.7.8:1080")]);
+        assert!(out.starts_with("[\n"));
+        assert_eq!(out.matches("--proxy-server=").count(), 2);
+        assert!(out.contains("  \"--proxy-server=http://1.2.3.4:8080\",\n"));
+        assert!(out.ends_with("]\n"));
+        assert_eq!(render_playwright(&[]), "[\n]\n");
+    }
+
+    #[test]
+    fn history_appends_one_line_and_leaves_malformed_lines_counted() {
+        let dir = std::env::temp_dir().join(format!("pxz-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        std::fs::write(&path, b"not json at all\n").unwrap();
+
+        assert_eq!(append_history(&dir, &history_row(3, 1)).unwrap(), 1);
+        let after_first = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after_first,
+            [
+                b"not json at all\n".to_vec(),
+                format!("{}\n", serde_json::to_string(&history_row(3, 1)).unwrap()).into_bytes(),
+            ]
+            .concat(),
+            "the malformed line must survive byte-for-byte, ahead of the new row"
+        );
+
+        assert_eq!(append_history(&dir, &history_row(0, 2)).unwrap(), 1);
+        let after_second = std::fs::read(&path).unwrap();
+        assert!(
+            after_second.starts_with(&after_first),
+            "a second append must extend the file, never rewrite it"
+        );
+        assert_eq!(after_second.iter().filter(|b| **b == b'\n').count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_counts_zero_skipped_for_a_clean_file() {
+        let dir = std::env::temp_dir().join(format!("pxz-history-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(append_history(&dir, &history_row(0, 0)).unwrap(), 0);
+        assert_eq!(append_history(&dir, &history_row(0, 0)).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pxz-history-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        append_history(&dir, &history_row(1, 0)).unwrap();
+        let mode = std::fs::metadata(dir.join("history.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "history mode {:o}", mode & 0o777);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn median_speed_lower_median_on_even_counts() {
+        let speeds = |values: &[u32]| -> Option<u32> {
+            let recs: Vec<LiveRecord> = values
+                .iter()
+                .enumerate()
+                .map(|(i, ms)| {
+                    let mut r = rec("http", &format!("192.0.2.{}:8080", i + 1));
+                    r.speed_ms = *ms;
+                    r
+                })
+                .collect();
+            median_speed(&recs)
+        };
+        assert_eq!(
+            speeds(&[40, 10, 30, 20]),
+            Some(20),
+            "even count takes the lower middle"
+        );
+        assert_eq!(speeds(&[30, 10, 20]), Some(20));
+        assert_eq!(speeds(&[]), None);
+    }
+
+    #[test]
+    fn median_speed_ignores_auth_required_records() {
+        let mut authed = rec("http", "192.0.2.9:8080");
+        authed.speed_ms = 5;
+        authed.tags = vec!["auth-required"];
+        let mut live = rec("http", "192.0.2.10:8080");
+        live.speed_ms = 100;
+        assert_eq!(median_speed(&[authed, live]), Some(100));
     }
 }

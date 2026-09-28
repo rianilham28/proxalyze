@@ -109,6 +109,16 @@ struct Cli {
     /// Keep only the top N records after ranking
     #[arg(long)]
     keep_top: Option<usize>,
+
+    /// Also write out/proxies.csv (RFC 4180, one row per record)
+    #[arg(long)]
+    csv: bool,
+    /// Also emit a renderer file: curl | playwright (repeatable)
+    #[arg(long = "emit", value_name = "FORMAT")]
+    emit: Vec<String>,
+    /// Append run stats + pool delta to <out>/history.jsonl
+    #[arg(long)]
+    history: bool,
 }
 
 /// Resource governor: reserve ~20% of the machine's parallelism for
@@ -133,6 +143,19 @@ fn resolve_backup_urls(user: &[String]) -> Vec<String> {
 /// Trimmed tag tokens, stored ready for both validation and matching.
 fn normalized_tags(raw: &[String]) -> Vec<String> {
     raw.iter().map(|t| t.trim().to_string()).collect()
+}
+
+/// Trimmed, lowercased, first-occurrence-wins: `--emit curl --emit CURL` is
+/// one renderer, not two writes to the same path.
+fn dedup_lower(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in raw {
+        let norm = value.trim().to_ascii_lowercase();
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    out
 }
 
 fn build_config(cli: &Cli) -> Result<Config, String> {
@@ -169,8 +192,8 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
         }
     };
     let cfg = Config {
-        debug: cli.debug,
         inputs,
+        debug: cli.debug,
         validate: config::Validate {
             check_url: cli.check_url.clone(),
             backup_urls,
@@ -182,6 +205,11 @@ fn build_config(cli: &Cli) -> Result<Config, String> {
         city_db: detect_city_db(),
         output: config::Output {
             dir: cli.out.clone(),
+            csv: cli.csv,
+            // Normalized once, here: `Config::check` validates the trimmed,
+            // lowercased token and `write_out` matches on that same form.
+            emit: dedup_lower(&cli.emit),
+            history: cli.history,
         },
         filters: config::Filters {
             // Normalized here, once: `Config::check` validates the trimmed
@@ -734,18 +762,31 @@ async fn async_main(
     );
     let mut reused = Vec::new();
     let mut reused_by_input = HashMap::new();
+    // Read once, before `write_out` overwrites proxies.jsonl: both skip-recent
+    // and the --history pool delta need the PREVIOUS run's records.
+    let jsonl_path = std::path::Path::new(&cfg.output.dir).join("proxies.jsonl");
+    let mut previous_pool: Option<Vec<model::LiveRecord>> = None;
     if cli.skip_recent > 0 {
-        let path = std::path::Path::new(&cfg.output.dir).join("proxies.jsonl");
-        if !path.exists() {
+        if !jsonl_path.exists() {
             qeprintln!("[skip ] no previous output · checking all");
         } else {
-            let (previous, skipped) = read_records(&path)?;
+            let (previous, skipped) = read_records(&jsonl_path)?;
             if skipped > 0 {
                 qeprintln!("[skip ] {skipped} prior records unreadable · ignored");
             }
             (candidates, reused, reused_by_input) =
                 partition_recent(candidates, &previous, now_secs(), cli.skip_recent);
+            if cfg.output.history {
+                previous_pool = Some(previous);
+            }
         }
+    }
+    if cfg.output.history && previous_pool.is_none() && jsonl_path.exists() {
+        let (previous, skipped) = read_records(&jsonl_path)?;
+        if skipped > 0 {
+            qeprintln!("[history] {skipped} prior records unreadable · delta may be off");
+        }
+        previous_pool = Some(previous);
     }
     let total = candidates.len();
     let parse_secs = t_parse.elapsed().as_secs_f64();
@@ -800,9 +841,14 @@ async fn async_main(
     } else {
         let dir = std::path::Path::new(&cfg.output.dir);
         std::fs::create_dir_all(dir)?;
-        Some(write_out(dir, &cfg.output, &records)?)
+        Some(write_out(
+            dir,
+            &cfg.output,
+            &records,
+            &cfg.validate.check_url,
+        )?)
     };
-    if let Some(written) = written {
+    if let Some(written) = &written {
         let files: Vec<String> = written
             .iter()
             .map(|p| {
@@ -815,6 +861,48 @@ async fn async_main(
             files.join(" \u{b7} "),
             t_write.elapsed().as_secs_f64()
         );
+    }
+    // Only a run that actually rewrote the pool has a pool_size/delta worth
+    // recording: when the zero-candidate guard above skipped the write, the
+    // on-disk pool is untouched and a row would read as "everything removed".
+    if cfg.output.history && written.is_some() {
+        let current_keys: std::collections::BTreeSet<String> =
+            records.iter().filter_map(persisted_record_key).collect();
+        let previous_keys: std::collections::BTreeSet<String> = previous_pool
+            .iter()
+            .flatten()
+            .filter_map(persisted_record_key)
+            .collect();
+        let (kept, dropped) = filtered;
+        let row = output::HistoryRow {
+            run_ts: now_secs(),
+            live: stats.live_total(),
+            elite: stats.live_elite,
+            anonymous: stats.live_anonymous,
+            transparent: stats.live_transparent,
+            unjudged: stats.live_unjudged,
+            auth: stats.auth_required,
+            tls_fail: stats.tls_fail,
+            socks_rejected: stats.socks_rejected,
+            tcp_alive: stats.tcp_alive,
+            dead: stats.dead,
+            median_speed_ms: output::median_speed(&records),
+            kept,
+            dropped,
+            pool_size: records.len(),
+            added: current_keys.difference(&previous_keys).count(),
+            removed: previous_keys.difference(&current_keys).count(),
+        };
+        let dir = std::path::Path::new(&cfg.output.dir);
+        let history_path = dir.join("history.jsonl");
+        let unreadable = output::append_history(dir, &row)?;
+        if unreadable > 0 {
+            qeprintln!("[history] {unreadable} prior rows unreadable · ignored");
+        }
+        let size = std::fs::metadata(&history_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        qprintln!("[history] {} ({size} bytes)", history_path.display());
     }
     qprintln!(
         "[done  ] {:.1}s total (parse {:.2} \u{b7} check {check_secs:.1} \u{b7} write {:.2})",
@@ -1210,5 +1298,40 @@ mod tests {
     fn cli_parses_skip_recent() {
         let cli = Cli::parse_from(["proxalyze", "--skip-recent", "42"]);
         assert_eq!(cli.skip_recent, 42);
+    }
+
+    #[test]
+    fn output_flags_default_off() {
+        let cfg = build_config(&Cli::parse_from(["proxalyze", "-i", "proxies.txt"])).unwrap();
+        assert!(!cfg.output.csv);
+        assert!(cfg.output.emit.is_empty());
+        assert!(!cfg.output.history);
+    }
+
+    #[test]
+    fn build_config_normalizes_and_dedups_emit_values() {
+        let cli = Cli::parse_from([
+            "proxalyze",
+            "-i",
+            "proxies.txt",
+            "--emit",
+            " Curl ",
+            "--emit",
+            "curl",
+            "--emit",
+            "Playwright",
+        ]);
+        let cfg = build_config(&cli).expect("valid emitters must build");
+        assert_eq!(cfg.output.emit, vec!["curl", "playwright"]);
+    }
+
+    #[test]
+    fn build_config_rejects_unknown_emit_format() {
+        let cli = Cli::parse_from(["proxalyze", "-i", "proxies.txt", "--emit", "wget"]);
+        let err = build_config(&cli).unwrap_err();
+        assert!(
+            err.contains("--emit FORMAT must be curl or playwright (got wget)"),
+            "{err}"
+        );
     }
 }

@@ -113,6 +113,13 @@ pub fn detect_city_db() -> Option<String> {
 #[derive(Debug, Clone, Default)]
 pub struct Output {
     pub dir: String,
+    /// Also write `proxies.csv` next to the two default files.
+    pub csv: bool,
+    /// Extra renderer files (`proxies.<FORMAT>`); values are validated in
+    /// `Config::check`, so a `write_out` reader can match on them directly.
+    pub emit: Vec<String>,
+    /// Append a run-stats row to `history.jsonl`.
+    pub history: bool,
 }
 
 impl Default for Validate {
@@ -203,6 +210,13 @@ impl Config {
             if !ok {
                 return Err(format!(
                     "--country expects ISO 3166-1 alpha-2 codes (got \"{c}\")"
+                ));
+            }
+        }
+        for format in &self.output.emit {
+            if !matches!(format.as_str(), "curl" | "playwright") {
+                return Err(format!(
+                    "--emit FORMAT must be curl or playwright (got {format})"
                 ));
             }
         }
