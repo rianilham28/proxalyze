@@ -82,13 +82,17 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
   `stable` tag, so the flag can be turned off without leaving stale tags.
 - **Throughput sampling.** `--probe-throughput` (which REQUIRES
   `--throughput-url URL`, or the run fails configuration) times a bounded
-  sample download through each live proxy and records `kbps` =
-  `bytes × 8 / elapsed_ms` alongside a `speed_tier`: `fast` at ≥ 2048 kbps,
-  `mid` at ≥ 512, `slow` below. The sample opens a **second connection through
-  the same proxy** — a SOCKS tunnel is one-destination, so the already-open
-  check tunnel cannot carry it — and reads at most 256 KiB inside the
-  remaining time budget, so a fast origin cannot inflate the figure. A failed
-  or truncated sample leaves the proxy live, with no tier.
+  sample download through each live proxy and records `kbps` in kilobits per
+  second — `bytes × 8 ÷ elapsed_ms`, i.e. `bytes × 8 × 1000 / elapsed_ms` — alongside
+  a `speed_tier`: `fast` at ≥ 2048 kbps, `mid` at ≥ 512, `slow` below. The
+  sample opens a **second connection through the same proxy** — a SOCKS tunnel
+  is one-destination, so the already-open check tunnel cannot carry it — and
+  reads at most 256 KiB inside the remaining time budget, so a fast origin
+  cannot inflate the figure. Reaching the 256 KiB cap is the normal success
+  path, and a body smaller than the cap still measures, so an ordinary
+  `speed.bin` is tiered normally. Only a transport error while reading the
+  body, or an exhausted time budget, yields no figure: the proxy stays live,
+  and the record carries neither `kbps` nor `speed_tier`.
 - **Capability probes.** `--probe-capabilities` sends two follow-ups on the
   live connection and tags `keep-alive` (a second plain GET on the same
   socket) and `chunked-post` (a chunked request body the origin did not
@@ -164,7 +168,8 @@ that quad with no whitespace would also be consumed as password data.
 - `--min-live N` exits with code 3 after reporting and writing outputs when fewer
   than `N` live proxies survive — counted **after** the write-stage filters and
   excluding `auth-required` records, so a filter that empties the pool fails
-  the gate rather than passing it. `N=0` disables the gate.
+  the gate rather than passing it. Carried-forward live records count here
+  too, alongside freshly probed ones. `N=0` disables the gate.
 - `--stable-after N` chains `runs_live` across runs and tags `stable` at N
   consecutive live runs, so `--require-tag stable` can feed a `--min-live`
   CI gate that only accepts proven survivors. `--keep-top N` and the other
@@ -231,9 +236,11 @@ Each `proxies.jsonl` line has:
   fact when a City database and lookup result are available. `kbps` is the
   measured throughput in kbit/s and `speed_tier` its bucket — `fast` at
   ≥ 2048 kbps, `mid` at ≥ 512, `slow` below — both present only when
-  `--probe-throughput` ran and the sample completed; a failed or truncated
-  sample leaves the record live with neither key. A `speed_tier` outside
-  `fast`/`mid`/`slow` is version skew, not a free-form label.
+  `--probe-throughput` ran and the sample produced a figure. A body smaller
+  than the 256 KiB cap is a normal measured sample, not a truncated one; only a
+  transport error while reading the body, or an exhausted time budget, leaves
+  the record live with neither key. A `speed_tier` outside `fast`/`mid`/`slow` is
+  version skew, not a free-form label.
 
 `tags` is a closed vocabulary, interned on decode: `hosting`, `cdn`, `mobile`,
 `vpn`, `residential-proxy`, `auth-required`, `stable`, `chunked-post`, and
@@ -241,8 +248,11 @@ Each `proxies.jsonl` line has:
 first six come from the run itself; `stable` from `--stable-after`, and
 `keep-alive`/`chunked-post` from `--probe-capabilities`.
 
-With `--history`, `<out>/history.jsonl` gains one appended row per run: the
-same verdict counters the summary prints (`live`, `elite`, `anonymous`,
+With `--history`, `<out>/history.jsonl` gains one appended row per run that
+actually rewrote the pool: a zero-candidate run with nothing carried forward
+skips the append, because the on-disk pool is untouched and a row would read
+as "everything removed". Each row carries `run_ts` (epoch seconds), the same
+verdict counters the summary prints (`live`, `elite`, `anonymous`,
 `transparent`, `unjudged`, `auth`, `tls_fail`, `socks_rejected`, `tcp_alive`,
 `dead`, `median_speed_ms`), the filter outcome (`kept`, `dropped`), and the
 pool delta against the previous `proxies.jsonl` (`pool_size`, `added`,
