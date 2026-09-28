@@ -51,7 +51,14 @@ pub const KNOWN_TAGS: &[&str] = &[
     "vpn",
     "residential-proxy",
     "auth-required",
+    "stable",
+    "chunked-post",
+    "keep-alive",
 ];
+/// Throughput buckets a record may carry. A value outside this list is
+/// version skew, not a free-form label.
+pub const SPEED_TIERS: &[&str] = &["fast", "mid", "slow"];
+
 /// Credentials attached to a list entry (`user:pass@host:port`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Auth {
@@ -122,6 +129,19 @@ pub struct ProbeResult {
     pub slot: i16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fail_reason: Option<String>,
+    /// Throughput measured by the bandwidth probe, kbit/s (Task 5 measures it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kbps: Option<u32>,
+    /// "fast" | "mid" | "slow" — the interned bucket for `kbps`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_tier: Option<&'static str>,
+    /// Protocol capability tags to merge into the record's network-class tags
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<&'static str>,
+    /// Milliseconds spent on follow-up decoration (e.g. the bandwidth probe);
+    /// subtracted from the reported speed so decoration never reads as
+    /// proxy latency
+    pub decor_ms: u32,
 }
 
 /// A judged, live proxy as written to the output files.
@@ -146,6 +166,14 @@ pub struct LiveRecord {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
+    /// Consecutive live runs observed across the history, including this one
+    pub runs_live: u32,
+    /// Throughput in kbit/s, when a bandwidth probe measured it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kbps: Option<u32>,
+    /// "fast" | "mid" | "slow" — the interned bucket for `kbps`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_tier: Option<&'static str>,
 }
 
 /// Aggregated check stats printed at the end of a run.
@@ -284,6 +312,10 @@ mod tests {
             proxy: "1.2.3.4:80".into(),
             scheme: "http",
             input: "f".into(),
+            kbps: None,
+            speed_tier: None,
+            caps: Vec::new(),
+            decor_ms: 0,
             status: "live",
             input_row: 0,
             anonymity: None,
@@ -323,6 +355,10 @@ mod tests {
         let first = ProbeResult {
             proxy: "1.2.3.4:80".into(),
             scheme: "http",
+            kbps: None,
+            speed_tier: None,
+            caps: Vec::new(),
+            decor_ms: 0,
             input: "shared".into(),
             input_row: 0,
             status: "live",

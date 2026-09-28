@@ -427,6 +427,10 @@ impl Validator {
             exit_ip: None,
             slot,
             fail_reason: None,
+            kbps: None,
+            speed_tier: None,
+            caps: Vec::new(),
+            decor_ms: 0,
         }
     }
 
@@ -801,6 +805,10 @@ impl Validator {
             exit_ip: None,
             slot: -1,
             fail_reason: None,
+            kbps: None,
+            speed_tier: None,
+            caps: Vec::new(),
+            decor_ms: 0,
         };
         match status {
             407 => return Err(("auth-required", "407 from proxy".to_string())),

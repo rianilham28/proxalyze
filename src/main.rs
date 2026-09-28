@@ -449,6 +449,7 @@ async fn check_all(
         if r.status == "auth-required" {
             tags.push("auth-required");
         }
+        tags.extend(r.caps.iter().copied());
         records.push(model::LiveRecord {
             proxy: format!("{}://{}", r.scheme, r.proxy),
             type_: r.scheme,
@@ -463,6 +464,9 @@ async fn check_all(
             source: r.input.clone(),
             country: r.exit_ip.and_then(|ip| judge.country(ip)),
             tags,
+            runs_live: 1,
+            kbps: r.kbps,
+            speed_tier: r.speed_tier,
         });
     }
     runner.await?;
@@ -1214,6 +1218,9 @@ mod tests {
                 tags: vec![],
                 source: "pool.txt".into(),
                 country: None,
+                runs_live: 1,
+                kbps: None,
+                speed_tier: None,
             });
         }
         candidates.push(
@@ -1249,6 +1256,9 @@ mod tests {
             tags: vec![],
             source: "pool.txt".into(),
             country: None,
+            runs_live: 1,
+            kbps: None,
+            speed_tier: None,
         };
         record.proxy = "http://:pass@192.0.2.10:8080".into();
         assert_eq!(
@@ -1294,6 +1304,9 @@ mod tests {
             tags: vec![],
             source: "inline.txt".into(),
             country: None,
+            runs_live: 1,
+            kbps: None,
+            speed_tier: None,
         };
         let (probed, reused, by_row) = partition_recent(vec![candidate], &[record], now, 3_600);
         assert!(probed.is_empty());
@@ -1358,6 +1371,9 @@ mod tests {
             tags: vec![],
             source: "pool.txt".into(),
             country: None,
+            runs_live: 1,
+            kbps: None,
+            speed_tier: None,
         }
     }
 

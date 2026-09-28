@@ -15,7 +15,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::config::{Filters, Output};
-use crate::model::LiveRecord;
+use crate::model::{KNOWN_TAGS, LiveRecord};
 
 /// Read persisted JSONL records, counting malformed or version-skew lines.
 pub fn read_records(path: &Path) -> Result<(Vec<LiveRecord>, usize), String> {
@@ -55,14 +55,13 @@ fn decode_record(line: &str) -> Result<LiveRecord, String> {
         .as_array()
         .ok_or_else(|| "missing tags".to_string())?
         .iter()
-        .map(|tag| match tag.as_str() {
-            Some("hosting") => Ok("hosting"),
-            Some("cdn") => Ok("cdn"),
-            Some("mobile") => Ok("mobile"),
-            Some("vpn") => Ok("vpn"),
-            Some("residential-proxy") => Ok("residential-proxy"),
-            Some("auth-required") => Ok("auth-required"),
-            _ => Err("unknown tag".into()),
+        .map(|tag| {
+            let tag = tag.as_str().ok_or("invalid tag")?;
+            KNOWN_TAGS
+                .iter()
+                .copied()
+                .find(|known| *known == tag)
+                .ok_or_else(|| "unknown tag".to_string())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let anonymity = match value.get("anonymity") {
@@ -105,6 +104,24 @@ fn decode_record(line: &str) -> Result<LiveRecord, String> {
                 .map_err(|_| "invalid exit_ip")?,
         ),
     };
+    let runs_live = match value.get("runs_live") {
+        None | Some(Value::Null) => 1,
+        Some(value) => u32::try_from(value.as_u64().ok_or("invalid runs_live")?)
+            .map_err(|_| "runs_live overflow")?,
+    };
+    let speed_tier = match value.get("speed_tier") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let tier = value.as_str().ok_or("invalid speed_tier")?;
+            Some(
+                crate::model::SPEED_TIERS
+                    .iter()
+                    .copied()
+                    .find(|known| *known == tier)
+                    .ok_or("unknown speed_tier")?,
+            )
+        }
+    };
     Ok(LiveRecord {
         proxy,
         type_,
@@ -132,6 +149,9 @@ fn decode_record(line: &str) -> Result<LiveRecord, String> {
             Some(v) => v.as_str().ok_or("invalid source")?.into(),
         },
         country: optional_string("country")?,
+        runs_live,
+        kbps: optional_u32("kbps")?,
+        speed_tier,
     })
 }
 
@@ -541,6 +561,9 @@ mod tests {
             source: "examples/sample.txt".into(),
             country: None,
             tags: vec![],
+            runs_live: 1,
+            kbps: None,
+            speed_tier: None,
         }
     }
     #[test]
@@ -561,6 +584,9 @@ mod tests {
             source: "pool.txt".into(),
             country: Some("US".into()),
             tags: vec!["vpn", "residential-proxy"],
+            runs_live: 1,
+            kbps: None,
+            speed_tier: None,
         };
         write_out(
             &dir,
@@ -586,6 +612,75 @@ mod tests {
         assert_eq!(back[0].country, record.country);
         assert_eq!(back[0].tags, record.tags);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A pre-upgrade row: no `runs_live`, no `kbps`, no `speed_tier`. It must
+    /// still decode — a `runs_live` of 1 is the honest default, and the line
+    /// must NOT be counted as skipped.
+    #[test]
+    fn legacy_row_decodes_with_default_runs_live() {
+        let line = r#"{"proxy":"http://203.0.113.10:8080","type":"http","last_checked":1789165501,"speed_ms":457,"connect_ms":128,"ttfb_ms":110,"anonymity":"elite","exit_ip":"203.0.113.10","asn":64512,"org":"Documentation Example ISP","tags":[],"source":"examples/sample.txt"}"#;
+        let record = decode_record(line).expect("legacy row must decode");
+        assert_eq!(record.runs_live, 1);
+        assert_eq!(record.kbps, None);
+        assert_eq!(record.speed_tier, None);
+    }
+
+    #[test]
+    fn new_fields_round_trip_through_write_and_read() {
+        let dir = std::env::temp_dir().join(format!("pxz-newfields-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut record = rec("http", "192.0.2.7:8080");
+        record.runs_live = 3;
+        record.kbps = Some(2048);
+        record.speed_tier = Some("fast");
+        write_out(
+            &dir,
+            &crate::config::Output::default(),
+            std::slice::from_ref(&record),
+            "https://check.example/ip",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(dir.join("proxies.jsonl")).unwrap();
+        let written: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(written["runs_live"], 3);
+        assert_eq!(written["kbps"], 2048);
+        assert_eq!(written["speed_tier"], "fast");
+        let (back, skipped) = read_records(&dir.join("proxies.jsonl")).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(back[0].runs_live, 3);
+        assert_eq!(back[0].kbps, Some(2048));
+        assert_eq!(back[0].speed_tier, Some("fast"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Strict interning: an unrecognized `speed_tier` is a version-skew line,
+    /// counted as skipped — never silently coerced to a valid tier.
+    #[test]
+    fn unknown_speed_tier_is_skipped_not_mangled() {
+        let dir = std::env::temp_dir().join(format!("pxz-tierskip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = r#"{"proxy":"http://192.0.2.8:8080","type":"http","last_checked":1,"speed_ms":10,"connect_ms":5,"tags":[],"source":"s.txt"}"#;
+        let bad = r#"{"proxy":"http://192.0.2.9:8080","type":"http","last_checked":1,"speed_ms":10,"connect_ms":5,"speed_tier":"warp","tags":[],"source":"s.txt"}"#;
+        std::fs::write(dir.join("proxies.jsonl"), format!("{good}\n{bad}\n")).unwrap();
+        let (records, skipped) = read_records(&dir.join("proxies.jsonl")).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(skipped, 1);
+        assert_eq!(records[0].speed_tier, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_tags_intern_via_known_tags_decoder() {
+        let line = r#"{"proxy":"http://192.0.2.11:8080","type":"http","last_checked":1,"speed_ms":10,"connect_ms":5,"tags":["stable","keep-alive","chunked-post"],"source":"s.txt"}"#;
+        let record = decode_record(line).expect("extended tags must intern");
+        assert_eq!(record.tags, vec!["stable", "keep-alive", "chunked-post"]);
+        for tag in &record.tags {
+            assert!(
+                crate::model::KNOWN_TAGS.contains(tag),
+                "{tag} did not intern through KNOWN_TAGS"
+            );
+        }
     }
 
     #[test]
@@ -835,6 +930,9 @@ mod tests {
                     .iter()
                     .map(|t| intern_tag(t.as_str().unwrap()))
                     .collect(),
+                runs_live: 1,
+                kbps: None,
+                speed_tier: None,
             })
             .collect();
         sort_records(&mut sorted);
