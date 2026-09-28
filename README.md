@@ -37,9 +37,9 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
   - `out/proxies.txt` — `scheme://[user:pass@]ip:port`
   - `out/proxies.jsonl` — one record per live or auth-required proxy, including
     `last_checked`, `speed_ms`, `connect_ms`, `ttfb_ms`, `anonymity`, `exit_ip`,
-    `asn`, `org`, `source`, `country`, and network-class `tags`
-    (`hosting`, `cdn`, `mobile`, `vpn`, `residential-proxy`, and
-    `auth-required`).
+    `asn`, `org`, `source`, `country`, network-class `tags`
+    (`hosting`, `cdn`, `mobile`, `vpn`, `residential-proxy`, `auth-required`,
+    plus the opt-in `stable`, `keep-alive`, and `chunked-post`).
   Records sort by anonymity/rank (elite → anonymous → transparent → live but
   unjudged → auth-required), then `speed_ms`, protocol, and address. Whenever
   outputs are written, each file gets mode `0600` on Unix and is atomically
@@ -55,6 +55,52 @@ proxalyze -i http.lst:http -i socks.lst:socks5 -j 2048
   Workers default to 80% of available parallelism; `RLIMIT_NOFILE` is raised
   automatically; checks have no retries; integrity checks hard-fail if probe or
   output-record counts do not match expectations.
+- **Write-stage filtering.** Six flags shape the surviving pool after ranking
+  and validation, in this order: `--require-tag` (record must carry ALL of the
+  listed tags), `--exclude-tag` (drop on ANY listed tag; exclude wins over
+  require), `--max-speed MS`, `--min-anonymity elite|anonymous` (a rank floor:
+  `elite` keeps only elite, `anonymous` also keeps anonymous and drops
+  transparent/unjudged/auth-required), `--country FR,DE` (case-insensitive ISO
+  list — a record with no `country` fact is dropped, unknown is not allowed),
+  and `--keep-top N` (truncate the ranked head, so it sees the survivors).
+  `--require-tag`/`--exclude-tag` are repeatable and validate against the known
+  tag vocabulary, so a typo is a clean config error. Whenever any filter is
+  active the summary gains `filters kept N · dropped M`.
+- **Output extensions.** `--csv` also writes `out/proxies.csv` (RFC 4180, one
+  row per record), `--emit curl|playwright` (repeatable) writes
+  `out/proxies.curl` and/or `out/proxies.playwright` renderer files in the same
+  best-first order, and `--history` appends a run-stats row to
+  `<out>/history.jsonl` — run stats plus the pool delta (`pool_size`, `added`,
+  `removed`) against the previous `proxies.jsonl`. History is append-only
+  (mode `0600`): a malformed or torn prior line is skipped and counted, never
+  rewritten.
+- **Stability across runs.** `--stable-after N` (N > 0) chains a `runs_live`
+  count off the previous pool and adds the `stable` tag once a record has
+  survived N consecutive live runs. A record absent from the previous pool
+  resets its chain to 1, and a record carried forward by `--skip-recent`
+  increments exactly once. `0` (the default) never tags and strips a carried
+  `stable` tag, so the flag can be turned off without leaving stale tags.
+- **Throughput sampling.** `--probe-throughput` (which REQUIRES
+  `--throughput-url URL`, or the run fails configuration) times a bounded
+  sample download through each live proxy and records `kbps` =
+  `bytes × 8 / elapsed_ms` alongside a `speed_tier`: `fast` at ≥ 2048 kbps,
+  `mid` at ≥ 512, `slow` below. The sample opens a **second connection through
+  the same proxy** — a SOCKS tunnel is one-destination, so the already-open
+  check tunnel cannot carry it — and reads at most 256 KiB inside the
+  remaining time budget, so a fast origin cannot inflate the figure. A failed
+  or truncated sample leaves the proxy live, with no tier.
+- **Capability probes.** `--probe-capabilities` sends two follow-ups on the
+  live connection and tags `keep-alive` (a second plain GET on the same
+  socket) and `chunked-post` (a chunked request body the origin did not
+  reject). A tag is earned only when the follow-up body reads to completion —
+  a socket that closes mid-body never earns `keep-alive`. The probe cost is
+  subtracted from the reported timing, and a failure only omits the tags; it
+  never changes the verdict.
+
+All of these are **default-off**: a run with no new flags behaves exactly as
+before — the same two output files, the same transcript lines, and the same
+tags. The one visible change is that every `proxies.jsonl` record now also
+carries the `runs_live` key.
 
 Probe statuses are `live`, `auth-required`, `tls-fail`, `socks-rejected`,
 `tcp-alive`, and `dead`. Live anonymity classes are `elite`, `anonymous`, and
@@ -116,8 +162,21 @@ that quad with no whitespace would also be consumed as password data.
   original `last_checked`, timings, `source`, `country`, and other data; the
   integrity summary reports `reused {n} fresh · probed {m}`. `0` disables reuse.
 - `--min-live N` exits with code 3 after reporting and writing outputs when fewer
-  than `N` live proxies were found, including carried-forward live records.
-  `N=0` disables the gate.
+  than `N` live proxies survive — counted **after** the write-stage filters and
+  excluding `auth-required` records, so a filter that empties the pool fails
+  the gate rather than passing it. `N=0` disables the gate.
+- `--stable-after N` chains `runs_live` across runs and tags `stable` at N
+  consecutive live runs, so `--require-tag stable` can feed a `--min-live`
+  CI gate that only accepts proven survivors. `--keep-top N` and the other
+  filters are applied first; `--min-live` sees only what survived them.
+
+A typical CI gate, plus the optional output shapes:
+
+```
+proxalyze -i proxies.txt --stable-after 3 --require-tag stable --min-live 10
+proxalyze -i proxies.txt --csv --emit curl --history --keep-top 500
+proxalyze -i proxies.txt --probe-throughput --throughput-url https://host/speed.bin
+```
 
 ## Example output
 
@@ -160,14 +219,35 @@ command above.
 Each `proxies.jsonl` line has:
 
 - always-present fields: `proxy`, `type`, `last_checked`, `speed_ms`,
-  `connect_ms`, `tags` (an array, possibly empty), and `source` (the input file,
-  or `-` for stdin; legacy or foreign prior JSONL rows without `source` decode
-  as `"unknown"` and can be carried forward verbatim by `--skip-recent`);
+  `connect_ms`, `tags` (an array, possibly empty), `runs_live` (consecutive live
+  runs observed across the history, including this one; legacy rows without it
+  decode as `1`), and `source` (the input file, or `-` for stdin; legacy or
+  foreign prior JSONL rows without `source` decode as `"unknown"` and can be
+  carried forward verbatim by `--skip-recent`);
 - always-present fields that may be JSON `null`: `ttfb_ms`, `anonymity`, and
   `exit_ip`; and
-- fields omitted entirely when unavailable: `asn`, `org`, and `country`. The
-  `country` value is an ISO code emitted only as a raw fact when a City database
-  and lookup result are available.
+- fields omitted entirely when unavailable: `asn`, `org`, `country`, `kbps`,
+  and `speed_tier`. The `country` value is an ISO code emitted only as a raw
+  fact when a City database and lookup result are available. `kbps` is the
+  measured throughput in kbit/s and `speed_tier` its bucket — `fast` at
+  ≥ 2048 kbps, `mid` at ≥ 512, `slow` below — both present only when
+  `--probe-throughput` ran and the sample completed; a failed or truncated
+  sample leaves the record live with neither key. A `speed_tier` outside
+  `fast`/`mid`/`slow` is version skew, not a free-form label.
+
+`tags` is a closed vocabulary, interned on decode: `hosting`, `cdn`, `mobile`,
+`vpn`, `residential-proxy`, `auth-required`, `stable`, `chunked-post`, and
+`keep-alive`. `--require-tag` and `--exclude-tag` validate against it. The
+first six come from the run itself; `stable` from `--stable-after`, and
+`keep-alive`/`chunked-post` from `--probe-capabilities`.
+
+With `--history`, `<out>/history.jsonl` gains one appended row per run: the
+same verdict counters the summary prints (`live`, `elite`, `anonymous`,
+`transparent`, `unjudged`, `auth`, `tls_fail`, `socks_rejected`, `tcp_alive`,
+`dead`, `median_speed_ms`), the filter outcome (`kept`, `dropped`), and the
+pool delta against the previous `proxies.jsonl` (`pool_size`, `added`,
+`removed`). Every field is always written, so a consumer never has to
+distinguish "absent" from "zero".
 
 ## GeoLite2 databases
 
@@ -216,7 +296,7 @@ misreported as proxy latency.
 ## Development
 
 ```
-cargo test --locked             # 118 tests, no network (unit + hermetic localhost-mock e2e)
+cargo test --locked             # 182 tests (149 unit + 33 hermetic localhost-mock e2e), no network
 cargo clippy --all-targets -- -D warnings
 ```
 
