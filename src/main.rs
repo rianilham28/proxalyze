@@ -518,13 +518,16 @@ type SummaryData<'a> = (
     &'a [String],
     &'a [usize],
     &'a [u64],
+    // Records reportable BEFORE write-stage filters (integrity line), then
+    // `(kept, dropped)` after filters; the filters line prints only when
+    // filters are active.
+    usize,
+    (usize, usize),
 );
 
 fn summary(
     stats: &Stats,
     data: &SummaryData<'_>,
-    reportable_before_filters: usize,
-    filtered: (usize, usize),
     total: usize,
     reused: usize,
     reused_by_input: &ReusedByInput,
@@ -560,7 +563,8 @@ fn summary(
             cfg.validate.connect_timeout,
         );
     }
-    let (per_file, per_target, labels, slot_caps, slot_errors) = *data;
+    let (per_file, per_target, labels, slot_caps, slot_errors, reportable_before_filters, filtered) =
+        *data;
     if !labels.is_empty() {
         qprintln!("  echoes    cap per target");
         for (i, url) in labels.iter().enumerate() {
@@ -808,9 +812,15 @@ async fn async_main(
     );
     summary(
         &stats,
-        &(&per_file, &per_target, &labels, &slot_caps, &slot_errors),
-        reportable_before_filters,
-        filtered,
+        &(
+            &per_file,
+            &per_target,
+            &labels,
+            &slot_caps,
+            &slot_errors,
+            reportable_before_filters,
+            filtered,
+        ),
         total,
         reused.len(),
         &reused_by_input,

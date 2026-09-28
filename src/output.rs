@@ -717,42 +717,52 @@ mod tests {
 
     fn with_anonymity(kind: &'static str) -> LiveRecord {
         let mut r = tagged(&[]);
-        r.anonymity = Some(kind.into());
+        r.anonymity = Some(kind);
         r
     }
 
     #[test]
     fn require_and_exclude_tag_gates() {
         let mut v = vec![tagged(&["hosting"])];
-        let mut f = crate::config::Filters::default();
-        f.require_tags = vec!["hosting".into()];
+        let f = Filters {
+            require_tags: vec!["hosting".into()],
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (1, 0));
 
         let mut v = vec![tagged(&["hosting"])];
-        let mut f = crate::config::Filters::default();
-        f.require_tags = vec!["cdn".into()];
+        let f = Filters {
+            require_tags: vec!["cdn".into()],
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (0, 1));
 
         let mut v = vec![tagged(&["hosting"])];
-        let mut f = crate::config::Filters::default();
-        f.exclude_tags = vec!["hosting".into()];
+        let f = Filters {
+            exclude_tags: vec!["hosting".into()],
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (0, 1));
     }
 
     #[test]
     fn require_and_exclude_on_same_tag_drops_record() {
         let mut v = vec![tagged(&["hosting"])];
-        let mut f = crate::config::Filters::default();
-        f.require_tags = vec!["hosting".into()];
-        f.exclude_tags = vec!["hosting".into()];
+        let f = Filters {
+            require_tags: vec!["hosting".into()],
+            exclude_tags: vec!["hosting".into()],
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (0, 1));
     }
 
     #[test]
     fn max_speed_drops_slow_and_keeps_boundary() {
         let mut v = vec![with_speed(100), with_speed(500), with_speed(501)];
-        let mut f = crate::config::Filters::default();
-        f.max_speed = Some(500);
+        let f = Filters {
+            max_speed: Some(500),
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (2, 1));
     }
 
@@ -765,8 +775,10 @@ mod tests {
             tagged(&[]),
             tagged(&["auth-required"]),
         ];
-        let mut f = crate::config::Filters::default();
-        f.min_anonymity = Some("elite".into());
+        let f = Filters {
+            min_anonymity: Some("elite".into()),
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (1, 4));
     }
 
@@ -775,16 +787,20 @@ mod tests {
         let mut fr = tagged(&[]);
         fr.country = Some("FR".into());
         let mut v = vec![fr, tagged(&[])];
-        let mut f = crate::config::Filters::default();
-        f.countries = vec!["fr".into()];
+        let f = Filters {
+            countries: vec!["fr".into()],
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (1, 1));
     }
 
     #[test]
     fn keep_top_truncates_sorted_prefix() {
         let mut v = vec![with_speed(10), with_speed(20), with_speed(30)];
-        let mut f = crate::config::Filters::default();
-        f.keep_top = Some(2);
+        let f = Filters {
+            keep_top: Some(2),
+            ..Default::default()
+        };
         assert_eq!(apply_filters(&mut v, &f), (2, 1));
         assert_eq!(
             v.iter().map(|r| r.speed_ms).collect::<Vec<_>>(),
@@ -796,9 +812,9 @@ mod tests {
     #[test]
     fn keep_top_zero_empties_and_counts_as_active() {
         let mut v = vec![with_speed(10), with_speed(20), with_speed(30)];
-        let f = crate::config::Filters {
+        let f = Filters {
             keep_top: Some(0),
-            ..crate::config::Filters::default()
+            ..Default::default()
         };
         assert_eq!(apply_filters(&mut v, &f), (0, 3));
         assert!(f.is_active());
@@ -808,7 +824,7 @@ mod tests {
     fn inactive_filters_change_nothing() {
         let mut v = vec![with_speed(30), with_speed(10), with_speed(20)];
         let before: Vec<u32> = v.iter().map(|r| r.speed_ms).collect();
-        let f = crate::config::Filters::default();
+        let f = Filters::default();
         assert_eq!(apply_filters(&mut v, &f), (3, 0));
         assert!(!f.is_active());
         let after: Vec<u32> = v.iter().map(|r| r.speed_ms).collect();
