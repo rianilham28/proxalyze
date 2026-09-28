@@ -104,6 +104,17 @@ impl hyper::body::Body for ProbeBody {
         }
     }
 
+    /// Both halves of `http_body_util::Empty`'s contract, so the Empty
+    /// variant encodes byte-identically to the `Empty<Bytes>` body the lane
+    /// used before. `is_end_stream() == true` is the load-bearing half:
+    /// hyper's client encoder routes it to `set_length(head, None)` and
+    /// inserts no header, whereas a known-zero `size_hint` alone routes to
+    /// `BodyLength::Known(0)` → `set_content_length` and adds
+    /// `content-length: 0` to every default-run request.
+    fn is_end_stream(&self) -> bool {
+        matches!(self, ProbeBody::Empty)
+    }
+
     fn size_hint(&self) -> hyper::body::SizeHint {
         match self {
             ProbeBody::Empty => hyper::body::SizeHint::with_exact(0),
@@ -1034,9 +1045,13 @@ impl Validator {
                 .as_ref()
                 .is_ok_and(|o| matches!(o, Ok((200..=299, _, _))))
         {
+            // Per-follow-up drain budget, not the whole remaining: one stalled
+            // drain must not starve the other probe, and both stay inside the
+            // outer remaining() timeout.
+            let drain = self.remaining(connected).min(Duration::from_millis(1500));
             let probed = tokio::time::timeout(
                 self.remaining(connected),
-                self.capability_probes(&mut sender, x),
+                self.capability_probes(&mut sender, x, drain),
             )
             .await
             .unwrap_or_else(|_| {
@@ -1202,20 +1217,27 @@ impl Validator {
         &self,
         sender: &mut hyper::client::conn::http1::SendRequest<BoxedBody>,
         x: &ConnExtras<'_>,
+        budget: Duration,
     ) -> (Vec<&'static str>, u32) {
         let mut caps = Vec::new();
         let mut decor_ms = 0u32;
-
+        // A follow-up only counts when its body is read to completion: that
+        // is what proves the connection really stayed open. A bounded drain
+        // is what separates that from a peer that answered a header and then
+        // closed the socket — a close-delimited body never ends on its own, so
+        // an unbounded read would hang and a swallowed error would tag a dead
+        // connection as keep-alive.
         let t0 = Instant::now();
         let keep_alive: Result<u16, String> =
             match self.request_keep_alive(x.target_url, x.origin_host, x.auth, true) {
                 Ok(req) => match sender.send_request(req).await {
-                    // Drain before the next request: hyper will not write it
-                    // while this response is unread.
                     Ok(resp) => {
                         let status = resp.status().as_u16();
-                        let _ = resp.into_body().collect().await;
-                        Ok(status)
+                        match tokio::time::timeout(budget, resp.into_body().collect()).await {
+                            Ok(Ok(_)) => Ok(status),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err("body timeout".into()),
+                        }
                     }
                     Err(e) => Err(e.to_string()),
                 },
@@ -1242,8 +1264,11 @@ impl Validator {
                 Ok(req) => match sender.send_request(req).await {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
-                        let _ = resp.into_body().collect().await;
-                        Ok(status)
+                        match tokio::time::timeout(budget, resp.into_body().collect()).await {
+                            Ok(Ok(_)) => Ok(status),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err("body timeout".into()),
+                        }
                     }
                     Err(e) => Err(e.to_string()),
                 },
@@ -1336,15 +1361,31 @@ impl Validator {
     /// Second dial through the same proxy, download the sample, and report
     /// kbps. `None` on any failure — a missing speed figure is decoration, so
     /// a proxy that cannot serve the sample stays live.
+    ///
+    /// The whole pass is bounded by a FRESH budget measured here, not the
+    /// echo's dial-anchored remainder (which is ~0 once the echo exchange
+    /// finishes and would starve every slow-but-live proxy of a speed tier).
+    /// The bound also has to cover the SOCKS handshakes: an unbounded
+    /// handshake would hold the echo slot permit open until the socket-level
+    /// timeout and serialize the candidates behind it.
     async fn throughput_probe(&self, c: &Candidate) -> Option<u32> {
-        let t = self.throughput.as_ref()?;
-        // Fresh budget: the echo's dial-anchored remainder is ~0 by now, and
-        // a ~0 budget would starve every slow-but-live proxy of a speed tier.
         let start = Instant::now();
+        tokio::time::timeout(self.cfg.total_timeout, self.throughput_pass(c, start))
+            .await
+            .ok()?
+    }
+
+    /// The pass itself, anchored on `start` so every helper's internal
+    /// `remaining(start)` budget is measured from the same instant.
+    async fn throughput_pass(&self, c: &Candidate, start: Instant) -> Option<u32> {
+        let t = self.throughput.as_ref()?;
         let tcp = tokio::time::timeout(self.cfg.connect_timeout, TcpStream::connect(c.addr))
             .await
             .ok()?
             .ok()?;
+        // Fresh dial anchor: the SOCKS helpers budget from `handshake_start`,
+        // never from the pass start (which a slow dial would have consumed).
+        let handshake_start = Instant::now();
         let _ = tcp.set_nodelay(true);
 
         // Layering mirrors the check flows exactly: proxy-facing TLS is
@@ -1380,14 +1421,14 @@ impl Validator {
             Scheme::Socks5 | Scheme::Socks4 => {
                 let inner = match c.scheme {
                     Scheme::Socks5 => self
-                        .socks5_handshake(tcp, c, &t.check.host, t.check.port, start)
+                        .socks5_handshake(tcp, c, &t.check.host, t.check.port, handshake_start)
                         .await
                         .ok()?,
                     _ => {
                         let Some(&IpAddr::V4(ip)) = t.ips.iter().find(|a| a.is_ipv4()) else {
                             return None; // socks4 has no proxy-side DNS
                         };
-                        self.socks4_handshake(tcp, c, ip, t.check.port, start)
+                        self.socks4_handshake(tcp, c, ip, t.check.port, handshake_start)
                             .await
                             .ok()?
                     }
@@ -2023,9 +2064,9 @@ mod tests {
             .expect("hitting the throughput cap is success, not an oversized error");
         server.abort();
 
-        assert!(
-            (1..=(THROUGHPUT_MAX as u64)).contains(&bytes),
-            "sample must stop at the 256 KiB cap, got {bytes}"
+        assert_eq!(
+            bytes, THROUGHPUT_MAX as u64,
+            "the sample must stop at exactly the 256 KiB cap (frame-size independent)"
         );
     }
 
@@ -2092,5 +2133,136 @@ mod tests {
         let mut caps = r.caps.clone();
         caps.sort_unstable();
         assert_eq!(caps, ["chunked-post", "keep-alive"]);
+    }
+
+    /// A peer that answers the follow-up's *head* and then closes must not
+    /// earn the keep-alive tag: the socket did not stay open, and that is
+    /// exactly what the tag claims.
+    #[tokio::test]
+    async fn close_delimited_followup_does_not_earn_keep_alive() {
+        let (client, mut peer) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut chunk = [0u8; 512];
+            let mut buf: Vec<u8> = Vec::new();
+            // Primary answered in full, so the verdict is genuinely live.
+            // The follow-ups get a close-delimited body and the socket then
+            // STAYS OPEN forever: the body never ends on its own, so only a
+            // bounded drain can complete — and only a failed drain may
+            // withhold the tag.
+            let truncated: &[u8] = b"HTTP/1.1 200 OK\r\nconnection: keep-alive\r\n\r\npartial";
+            for response in [&ok_body()[..], truncated].into_iter().chain([truncated]) {
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = peer.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let _ = peer.write_all(response).await;
+                let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                buf.drain(..end);
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut v = validator();
+        v.cfg.probe_capabilities = true;
+        let uri = check_uri();
+        let req = v.request(&uri, None, None).unwrap();
+        let extras = v.extras(&uri, None, None).unwrap();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            v.run_conn(client, req, Instant::now(), ip("127.0.0.1"), Some(&extras)),
+        )
+        .await
+        .expect("a truncated follow-up must not hang the check")
+        .expect("the primary verdict still stands");
+        let _ = server.await;
+
+        assert!(
+            !r.caps.contains(&"keep-alive"),
+            "a socket that closed mid-body did not keep alive: {:?}",
+            r.caps
+        );
+    }
+
+    /// A proxy that accepts the dial and then never answers must still yield
+    /// None promptly: a stall anywhere in the pass (handshake, CONNECT, TLS,
+    /// or the download) must cost at most one budget, not the socket timeout.
+    /// Each helper bounds itself from a fresh anchor, and `throughput_probe`
+    /// adds a pass-level bound on top; this asserts the observable contract.
+    #[tokio::test]
+    async fn throughput_pass_is_bounded_when_the_proxy_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // accepts the connection, then never speaks
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut v = validator();
+        v.cfg.probe_throughput = true;
+        v.cfg.total_timeout = Duration::from_millis(300);
+        v.throughput = Some(ResolvedTarget {
+            check: CheckTarget {
+                tls: false,
+                host: "127.0.0.1".into(),
+                port: 9,
+                path: "/big.bin".into(),
+                url: "http://127.0.0.1:9/big.bin".into(),
+            },
+            ips: vec![ip("127.0.0.1")],
+            authority: "127.0.0.1:9".into(),
+        });
+        let c = Candidate {
+            addr,
+            scheme: Scheme::Http,
+            auth: None,
+            input: String::new(),
+            input_row: None,
+        };
+
+        let t0 = Instant::now();
+        let kbps = tokio::time::timeout(Duration::from_secs(5), v.throughput_probe(&c))
+            .await
+            .expect("throughput_probe must be bounded by its own budget");
+        assert!(kbps.is_none(), "a stalled proxy yields no speed figure");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "the pass must abort near its budget, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// The default run's primary request must stay byte-identical to the
+    /// `Empty<Bytes>` body it used before: `connection: close` present and
+    /// no `transfer-encoding`.
+    #[tokio::test]
+    async fn default_run_primary_request_is_byte_identical() {
+        let (client, peer) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move { serve(peer, vec![ok_body()]).await });
+
+        let v = validator(); // probe_capabilities: false
+        let uri = check_uri();
+        let req = v.request(&uri, None, None).unwrap();
+        assert!(v.extras(&uri, None, None).is_none(), "no extras when off");
+        let r = v
+            .run_conn(client, req, Instant::now(), ip("127.0.0.1"), None)
+            .await
+            .expect("one answered request is a live proxy");
+        let seen = server.await.unwrap();
+
+        let head = String::from_utf8_lossy(&seen[0]).to_ascii_lowercase();
+        assert!(
+            head.contains("connection: close"),
+            "the default run must still close the connection: {head}"
+        );
+        assert!(
+            !head.contains("content-length"),
+            "a GET with an end-of-stream body must carry no content-length, \
+             exactly as before Task 5: {head}"
+        );
+        assert!(r.caps.is_empty(), "no capability tags when the flag is off");
     }
 }
