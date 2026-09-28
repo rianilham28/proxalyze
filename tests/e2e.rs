@@ -489,7 +489,10 @@ fn query_string_survives_socks5_tunnel() {
         records(&dir.path().join("proxies.jsonl"))[0]["anonymity"],
         "elite"
     );
-    let targets = echo.targets();
+    // The per-connection handler records from its own thread, so an immediate
+    // read after the child exits can race it: wait for the post-startup
+    // request instead.
+    let targets = echo.wait_for_targets(2, std::time::Duration::from_secs(2));
     // targets[0] is the direct startup shape-check; the SOCKS5 probe is only
     // evidence when a distinct post-startup request retained the query.
     assert!(targets.len() >= 2, "recorded targets: {targets:?}");
@@ -838,11 +841,15 @@ fn default_run_has_no_probe_fields() {
 
 #[test]
 fn throughput_large_body_yields_kbps_not_oversized() {
-    // Twice the 256 KiB sample cap, so the probe must stop at the cap rather
-    // than report the body as oversized.
+    // Twice the 256 KiB sample cap: the probe must stop at the cap and still
+    // report a speed, rather than calling the body oversized.
     const BIG: usize = 512 * 1024;
+    const SAMPLE_CAP: usize = 256 * 1024;
     let echo = EchoServer::start_with_big_body(EchoMode::Elite, BIG);
-    let proxy = HttpProxyMock::open("127.0.0.1");
+    // Pass-through mode: the sample must come from the echo's /big body. A
+    // mock that answered the forward request itself would make this test
+    // pass on a 9-byte body, so the measured sample size is asserted too.
+    let proxy = HttpProxyMock::open_relaying("127.0.0.1");
     let dir = TestDir::new("throughput_big_body");
     let input = dir.path().join("input.txt");
     std::fs::write(&input, format!("127.0.0.1:{}\n", proxy.addr.port())).unwrap();
@@ -858,6 +865,7 @@ fn throughput_large_body_yields_kbps_not_oversized() {
             "--probe-throughput",
             "--throughput-url",
             &big,
+            "--debug",
         ],
     );
     assert!(output.status.success(), "{}", stderr(&output));
@@ -870,6 +878,27 @@ fn throughput_large_body_yields_kbps_not_oversized() {
     assert!(
         ["fast", "mid", "slow"].contains(&tier),
         "speed_tier: {tier}"
+    );
+
+    // The measured sample must be the capped body, not a short one: a
+    // regression that shrank THROUGHPUT_MAX, or a pass-through that never
+    // happened, both fail here while leaving kbps positive and a tier valid.
+    let log = stderr(&output);
+    let sampled: usize = log
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("[throughput] "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|bytes| bytes.parse().ok())
+        .expect("a --debug throughput line reporting the sample size");
+    assert_eq!(
+        sampled, SAMPLE_CAP,
+        "sample must stop at the 256 KiB cap; log:\n{log}"
+    );
+    // The body really flowed from the echo, not from the mock's own stub.
+    let targets = echo.wait_for_targets(2, std::time::Duration::from_secs(2));
+    assert!(
+        targets.iter().any(|target| target.ends_with("/big")),
+        "the /big body must actually be fetched: {targets:?}"
     );
 }
 
@@ -949,38 +978,26 @@ fn csv_and_curl_written_and_filter_counts_shown() {
     ];
     let first = common::run_with(&dir, &args);
     assert!(first.status.success(), "{}", stderr(&first));
-    let unfiltered = records(&dir.path().join("proxies.jsonl"));
-    assert_eq!(unfiltered.len(), 2);
-    let csv = std::fs::read_to_string(dir.path().join("proxies.csv")).unwrap();
-    let curl = std::fs::read_to_string(dir.path().join("proxies.curl")).unwrap();
-    assert_eq!(
-        csv.lines().count(),
-        unfiltered.len() + 1,
-        "header plus one row per record"
-    );
-    assert_eq!(curl.lines().count(), unfiltered.len());
-    assert!(
-        stdout(&first).contains("filters   kept 2 · dropped 0"),
-        "{}",
-        stdout(&first)
-    );
-
-    // A second REAL run, so the records are freshly derived. Its `hosting`
-    // tag can only come from a GeoLite2 database, which a hermetic test
-    // cannot have — so the formats and the summary must still agree with
-    // each other at the pre-filter count.
-    let second = common::run_with(&dir, &args);
-    assert!(second.status.success(), "{}", stderr(&second));
     let kept = records(&dir.path().join("proxies.jsonl"));
     assert_eq!(kept.len(), 2);
     let csv = std::fs::read_to_string(dir.path().join("proxies.csv")).unwrap();
     let curl = std::fs::read_to_string(dir.path().join("proxies.curl")).unwrap();
-    assert_eq!(csv.lines().count(), kept.len() + 1);
+    assert_eq!(
+        csv.lines().count(),
+        kept.len() + 1,
+        "header plus one row per record"
+    );
     assert_eq!(curl.lines().count(), kept.len());
+    // The filters line is shown whenever a filter is active, and its `kept`
+    // must equal what actually landed in the outputs. The count of `dropped`
+    // is not asserted here: a hermetic run has no GeoLite2 database, so
+    // `--exclude-tag hosting` can never match and the drop path is covered by
+    // `require_and_exclude_same_tag_via_cli_drops_everything` and
+    // `keep_top_truncates_output_and_summary_counts` instead.
+    let summary = stdout(&first);
     assert!(
-        stdout(&second).contains("filters   kept 2 · dropped 0"),
-        "{}",
-        stdout(&second)
+        summary.contains(&format!("filters   kept {} · dropped", kept.len())),
+        "{summary}"
     );
 }
 

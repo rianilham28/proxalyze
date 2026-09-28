@@ -80,6 +80,13 @@ const BIG_PATH: &str = "/big";
 /// client that never goes away cannot pin a mock thread.
 const MAX_REQUESTS_PER_CONNECTION: usize = 4;
 
+/// How long a mock waits for the NEXT request head on a connection it has
+/// already answered. Generous enough for a real follow-up (the client sends
+/// it immediately on the same stream) but short enough that a client which
+/// sent `Connection: close` does not pin the handler thread while the suite's
+/// `Drop` joins it.
+const IDLE_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// The startup shape-check must consume the own-egress response; a static
 /// server otherwise cannot tell elite from anonymous.
 const OWN_EGRESS: &str = "198.51.100.9";
@@ -156,10 +163,6 @@ impl EchoServer {
         self.targets.lock().unwrap().clone()
     }
 
-    pub fn transfer_encodings(&self) -> Vec<String> {
-        self.transfer_encodings.lock().unwrap().clone()
-    }
-
     /// `targets()` after the detached per-connection threads have had a
     /// chance to record, or a panic once `timeout` elapses. A connection
     /// handler records from its own thread, so an immediate read after the
@@ -181,9 +184,7 @@ impl EchoServer {
 /// then path, and only then the global GET ordinal.
 fn handle_echo(mut stream: TcpStream, fixture: &EchoFixture) {
     make_blocking(&stream);
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
+    stream.set_read_timeout(Some(IDLE_READ_TIMEOUT)).unwrap();
     let mut served = 0usize;
     while served < MAX_REQUESTS_PER_CONNECTION {
         let Some(head) = read_http_head(&mut stream) else {
@@ -248,6 +249,9 @@ pub struct HttpProxyMock {
     /// follow-ups actually land: an HTTP proxy answers them itself, so the
     /// echo never sees them.
     requests: Arc<Mutex<Vec<RequestCapture>>>,
+    /// Forward absolute-form requests to the real target instead of
+    /// answering them from `body`.
+    relay: bool,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -261,11 +265,25 @@ pub struct RequestCapture {
 
 impl HttpProxyMock {
     pub fn open(body: &str) -> Self {
-        Self::build(None, body.into(), 200)
+        Self::build(None, body.into(), 200, false)
+    }
+
+    /// Forwards absolute-form requests to the real target, relaying the
+    /// response verbatim, so a `--throughput-url` sample flows from the
+    /// origin rather than from this mock's own body. Origin-form requests
+    /// (the check and its capability follow-ups) are still answered from
+    /// `body`.
+    pub fn open_relaying(body: &str) -> Self {
+        Self::build(None, body.into(), 200, true)
     }
 
     pub fn requiring_auth(user: &str, password: &str, body: &str) -> Self {
-        Self::build(Some((user.into(), password.into())), body.into(), 200)
+        Self::build(
+            Some((user.into(), password.into())),
+            body.into(),
+            200,
+            false,
+        )
     }
 
     pub fn unauthorized() -> Self {
@@ -273,14 +291,20 @@ impl HttpProxyMock {
             Some(("required".into(), "secret".into())),
             String::new(),
             407,
+            false,
         )
     }
 
     pub fn unavailable() -> Self {
-        Self::build(None, "unavailable".into(), 503)
+        Self::build(None, "unavailable".into(), 503, false)
     }
 
-    fn build(required_auth: Option<(String, String)>, body: String, status: u16) -> Self {
+    fn build(
+        required_auth: Option<(String, String)>,
+        body: String,
+        status: u16,
+        relay: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -311,6 +335,7 @@ impl HttpProxyMock {
                                 status,
                                 keepalive,
                                 requests,
+                                relay,
                             )
                         });
                     }
@@ -326,6 +351,7 @@ impl HttpProxyMock {
             accepts,
             keepalive,
             requests,
+            relay,
             stop,
             thread: Some(thread),
         }
@@ -340,18 +366,13 @@ impl HttpProxyMock {
         self.keepalive.load(Ordering::SeqCst)
     }
 
-    /// Every request the forward path received, in arrival order.
-    pub fn requests(&self) -> Vec<RequestCapture> {
-        self.requests.lock().unwrap().clone()
-    }
-
     /// Wait until the forward path has recorded `min` requests, so a caller
     /// that reads immediately after the child exits cannot race the
     /// per-connection threads.
     pub fn wait_for_requests(&self, min: usize, timeout: Duration) -> Vec<RequestCapture> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let captured = self.requests();
+            let captured = self.requests.lock().unwrap().clone();
             if captured.len() >= min || std::time::Instant::now() >= deadline {
                 return captured;
             }
@@ -373,9 +394,10 @@ fn handle_http_proxy(
     status: u16,
     keepalive: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<RequestCapture>>>,
+    relay: bool,
 ) {
     make_blocking(&stream);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let _ = stream.set_read_timeout(Some(IDLE_READ_TIMEOUT));
     // Bounded loop: a capability probe rides the SAME connection for a
     // keep-alive GET and a chunked POST, so a mock that answered once and
     // dropped the stream could never earn either tag. Closing after a
@@ -401,6 +423,19 @@ fn handle_http_proxy(
         if connect_authority(first).is_some() {
             // A tunnel consumes the connection outright.
             serve_connect(&mut stream, &head, auth);
+            return;
+        }
+        if relay && let Some(authority) = absolute_form_authority(first) {
+            // Absolute-form request in pass-through mode: the body must come
+            // from the real origin, not from this mock.
+            if let Ok(mut target) = TcpStream::connect(authority) {
+                let _ = target.set_read_timeout(Some(Duration::from_secs(1)));
+                if target.write_all(head.as_bytes()).is_ok() {
+                    relay_bidirectional(stream.try_clone().unwrap(), target);
+                    return;
+                }
+            }
+            let _ = write_http_response(&mut stream, 502, "pass-through failed", true);
             return;
         }
         if auth.is_some_and(|(u, p)| !has_basic_auth(&head, u, p)) {
@@ -766,6 +801,21 @@ fn read_socks_connect(stream: &mut TcpStream) -> Option<SocketAddr> {
     let mut port = [0u8; 2];
     stream.read_exact(&mut port).ok()?;
     Some(SocketAddr::new(host, u16::from_be_bytes(port)))
+}
+
+/// Host:port of an absolute-form forward request (`GET http://h:port/p HTTP/1.1`).
+/// The scheme is stripped, so a `https://` target would still be forwarded in
+/// the clear — the mocks here only ever carry plain-HTTP targets.
+fn absolute_form_authority(request_line: &str) -> Option<&str> {
+    let target = request_line.split_ascii_whitespace().nth(1)?;
+    if !target.contains("://") {
+        return None;
+    }
+    let authority = target.split_once("://")?.1;
+    let tail = authority
+        .split_once('/')
+        .map_or(authority, |(host, _)| host);
+    (!tail.is_empty()).then_some(tail)
 }
 
 pub(crate) fn connect_authority(request_line: &str) -> Option<&str> {
